@@ -1179,6 +1179,7 @@ fn upgrade_waits_for_one_supervisor_convergence_retry() {
     let observer_ocm_home = ocm_home.clone();
     let observer = thread::spawn(move || {
         let mut last_binding = "old".to_string();
+        let mut last_desired_running = true;
         let mut next_pid = 4243;
         let mut restart_acknowledged = false;
         let mut backoff_started = None;
@@ -1200,7 +1201,22 @@ fn upgrade_waits_for_one_supervisor_convergence_retry() {
                 .and_then(|entry| entry["serviceRunning"].as_bool())
                 .unwrap_or(true);
 
-            if binding != last_binding && desired_running {
+            if desired_running != last_desired_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &observer_runtime_path,
+                        &observer_ocm_home,
+                        &binding,
+                        next_pid,
+                        health_port,
+                    );
+                    next_pid += 1;
+                } else {
+                    write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
+                }
+                last_desired_running = desired_running;
+                last_binding = binding.clone();
+            } else if binding != last_binding && desired_running {
                 write_running_supervisor_runtime(
                     &observer_runtime_path,
                     &observer_ocm_home,
