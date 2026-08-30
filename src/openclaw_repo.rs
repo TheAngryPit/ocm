@@ -168,11 +168,20 @@ pub(crate) fn remove_openclaw_simulation_worktree(
         ));
     }
 
+    ensure_registered_worktree_identity(repo_root, worktree_root)?;
     remove_generated_simulation_outputs(worktree_root)?;
     remove_openclaw_worktree_checked(repo_root, worktree_root)
 }
 
 fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
+    ensure_registered_worktree_identity(repo_root, worktree_root)?;
+    remove_registered_worktree(repo_root, worktree_root)
+}
+
+fn ensure_registered_worktree_identity(
+    repo_root: &Path,
+    worktree_root: &Path,
+) -> Result<(), String> {
     let registered = match registered_worktree_paths(repo_root) {
         Ok(registered) => registered,
         Err(_) if !worktree_root.exists() => return Ok(()),
@@ -195,10 +204,14 @@ fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> R
         ));
     }
 
-    remove_registered_worktree(repo_root, worktree_root)
+    Ok(())
 }
 
 fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), String> {
+    if !worktree_root.exists() {
+        return Ok(());
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_root)
@@ -661,6 +674,39 @@ mod tests {
         );
         assert!(!generated.exists());
         assert!(worktree.exists());
+    }
+
+    #[test]
+    fn simulation_cleanup_does_not_touch_replaced_unregistered_checkout() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        fs::create_dir_all(worktree.join("dist")).unwrap();
+        fs::write(worktree.join(".gitignore"), "dist/\n").unwrap();
+        fs::write(worktree.join("dist/operator-output.txt"), "preserve\n").unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        assert!(error.contains("not registered"));
+        assert_eq!(
+            fs::read_to_string(worktree.join("dist/operator-output.txt")).unwrap(),
+            "preserve\n"
+        );
     }
 
     #[cfg(unix)]
