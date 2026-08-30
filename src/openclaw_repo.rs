@@ -98,7 +98,11 @@ pub(crate) fn ensure_openclaw_worktree(
 
     if worktree_registered {
         if !worktree_root.exists() {
-            remove_registered_worktree(&repo_root, &worktree_root)?;
+            remove_registered_worktree(
+                &repo_root,
+                &worktree_root,
+                WorktreeCleanupPolicy::PreserveIgnoredLocalFiles,
+            )?;
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
             return Ok(worktree_root);
         } else {
@@ -151,6 +155,45 @@ pub(crate) fn remove_openclaw_worktree(
     repo_root: &Path,
     worktree_root: &Path,
 ) -> Result<(), String> {
+    remove_openclaw_worktree_with_policy(
+        repo_root,
+        worktree_root,
+        WorktreeCleanupPolicy::PreserveIgnoredLocalFiles,
+    )
+}
+
+pub(crate) fn remove_openclaw_simulation_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+    simulation_name: &str,
+) -> Result<(), String> {
+    let expected = default_worktree_root(repo_root, simulation_name);
+    if normalize_worktree_path(worktree_root) != normalize_worktree_path(&expected) {
+        return Err(format!(
+            "refusing simulation cleanup outside its OCM-owned worktree: expected {}, found {}",
+            display_path(&expected),
+            display_path(worktree_root)
+        ));
+    }
+
+    remove_openclaw_worktree_with_policy(
+        repo_root,
+        worktree_root,
+        WorktreeCleanupPolicy::DiscardIgnoredLocalFiles,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum WorktreeCleanupPolicy {
+    PreserveIgnoredLocalFiles,
+    DiscardIgnoredLocalFiles,
+}
+
+fn remove_openclaw_worktree_with_policy(
+    repo_root: &Path,
+    worktree_root: &Path,
+    cleanup_policy: WorktreeCleanupPolicy,
+) -> Result<(), String> {
     let registered = match registered_worktree_paths(repo_root) {
         Ok(registered) => registered,
         Err(_) if !worktree_root.exists() => return Ok(()),
@@ -173,11 +216,15 @@ pub(crate) fn remove_openclaw_worktree(
         ));
     }
 
-    remove_registered_worktree(repo_root, worktree_root)
+    remove_registered_worktree(repo_root, worktree_root, cleanup_policy)
 }
 
-fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
-    ensure_worktree_clean(worktree_root)?;
+fn remove_registered_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+    cleanup_policy: WorktreeCleanupPolicy,
+) -> Result<(), String> {
+    ensure_worktree_clean(worktree_root, cleanup_policy)?;
 
     let output = Command::new("git")
         .arg("-C")
@@ -196,7 +243,10 @@ fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<
     Err(format!("git worktree remove failed: {detail}"))
 }
 
-fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
+fn ensure_worktree_clean(
+    worktree_root: &Path,
+    cleanup_policy: WorktreeCleanupPolicy,
+) -> Result<(), String> {
     if !worktree_root.exists() {
         return Ok(());
     }
@@ -226,7 +276,12 @@ fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
         ));
     }
 
-    ensure_no_ignored_local_files(worktree_root)?;
+    if matches!(
+        cleanup_policy,
+        WorktreeCleanupPolicy::PreserveIgnoredLocalFiles
+    ) {
+        ensure_no_ignored_local_files(worktree_root)?;
+    }
     Ok(())
 }
 
@@ -493,13 +548,108 @@ fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
         .map_err(|_| "git returned a non-UTF-8 path".to_string())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
-    use super::{parse_legacy_registered_worktree_paths, parse_registered_worktree_paths};
+    use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use super::parse_registered_worktree_paths;
+    use super::{
+        ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
+        remove_openclaw_simulation_worktree, remove_openclaw_worktree,
+    };
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_openclaw_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("openclaw");
+        fs::create_dir_all(repo.join("scripts")).unwrap();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"name":"openclaw","version":"test"}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("scripts/run-node.mjs"), "console.log('test');\n").unwrap();
+        fs::write(
+            repo.join(".gitignore"),
+            "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\n.env\n",
+        )
+        .unwrap();
+
+        let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
+        assert!(init.status.success());
+        run_git(&repo, &["config", "user.email", "tests@example.com"]);
+        run_git(&repo, &["config", "user.name", "OCM Tests"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        (temp, repo)
+    }
+
+    #[test]
+    fn simulation_cleanup_discards_ignored_outputs_only_for_owned_worktree() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        for relative in [
+            "node_modules/pkg/index.js",
+            ".artifacts/build.json",
+            "dist/index.js",
+            "dist-runtime/index.js",
+            "packages/demo/dist/index.js",
+        ] {
+            let path = worktree.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "generated\n").unwrap();
+        }
+
+        let ordinary_error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+        assert!(ordinary_error.contains("contains ignored local files"));
+        assert!(worktree.exists());
+
+        let ownership_error =
+            remove_openclaw_simulation_worktree(&repo, &worktree, "other-sim").unwrap_err();
+        assert!(ownership_error.contains("outside its OCM-owned worktree"));
+        assert!(worktree.exists());
+
+        remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap();
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn simulation_cleanup_preserves_untracked_files() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
+
+        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        assert!(error.contains("contains modified or untracked files"));
+        assert_eq!(
+            fs::read_to_string(worktree.join("operator-notes.txt")).unwrap(),
+            "preserve\n"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn worktree_porcelain_parser_preserves_non_utf8_paths() {
         let paths = parse_registered_worktree_paths(

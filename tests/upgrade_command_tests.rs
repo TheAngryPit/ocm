@@ -694,6 +694,11 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
         "console.log('watch');\n",
     )
     .unwrap();
+    fs::write(
+        repo.join(".gitignore"),
+        "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\n",
+    )
+    .unwrap();
 
     let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
     assert!(
@@ -776,7 +781,13 @@ case "$1" in
     touch node_modules/.bin/tsx
     exit 0
     ;;
-  build|ui:build)
+  build)
+    mkdir -p .artifacts dist dist-runtime packages/demo/dist
+    touch .artifacts/build.json dist/index.js dist-runtime/index.js packages/demo/dist/index.js
+    echo "$1 ok"
+    exit 0
+    ;;
+  ui:build)
     echo "$1 ok"
     exit 0
     ;;
@@ -3064,6 +3075,7 @@ fn upgrade_simulate_reports_local_repo_doctor_failures() {
     assert!(!simulate.status.success(), "{}", stdout(&simulate));
     let output = stdout(&simulate);
     assert!(output.contains("outcome=failed"), "{output}");
+    assert!(output.contains("cleanup=cleaned"), "{output}");
     assert!(output.contains("check=openclaw doctor"), "{output}");
     assert!(output.contains("Cannot find module 'grammy'"), "{output}");
 

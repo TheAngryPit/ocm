@@ -1,8 +1,11 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use time::Duration;
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
+use crate::openclaw_repo::remove_openclaw_simulation_worktree;
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
@@ -364,6 +367,19 @@ impl<'a> EnvironmentService<'a> {
         let meta = remove_environment(name, force, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
+    }
+
+    pub(crate) fn remove_simulation(&self, name: &str) -> Result<EnvMeta, String> {
+        let _lock = self.lock_operation(name)?;
+        let meta = get_environment(name, self.env, self.cwd)?;
+        if let Some(dev) = meta.dev.as_ref() {
+            remove_openclaw_simulation_worktree(
+                Path::new(&dev.repo_root),
+                Path::new(&dev.worktree_root),
+                &meta.name,
+            )?;
+        }
+        self.remove_locked(name, true)
     }
 
     pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
