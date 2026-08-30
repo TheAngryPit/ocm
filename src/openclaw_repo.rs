@@ -220,10 +220,15 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
             "-ffdX",
             "--",
             "node_modules",
+            ":(glob)**/node_modules",
             ".artifacts",
             "dist",
             "dist-runtime",
             ":(glob)packages/*/dist",
+            "extensions/canvas/src/host/a2ui",
+            "extensions/diffs-language-pack/assets",
+            "extensions/diffs/assets",
+            "extensions/discord/assets",
         ])
         .output()
         .map_err(|error| format!("failed to remove generated simulation output: {error}"))?;
@@ -601,7 +606,7 @@ mod tests {
         fs::write(repo.join("scripts/run-node.mjs"), "console.log('test');\n").unwrap();
         fs::write(
             repo.join(".gitignore"),
-            "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\n.env\n",
+            "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\nextensions/canvas/src/host/a2ui/\nextensions/diffs-language-pack/assets/\nextensions/diffs/assets/\nextensions/discord/assets/\n.env\n",
         )
         .unwrap();
 
@@ -620,10 +625,15 @@ mod tests {
         let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
         for relative in [
             "node_modules/pkg/index.js",
+            "extensions/demo/node_modules/pkg/index.js",
             ".artifacts/build.json",
             "dist/index.js",
             "dist-runtime/index.js",
             "packages/demo/dist/index.js",
+            "extensions/canvas/src/host/a2ui/index.html",
+            "extensions/diffs-language-pack/assets/viewer-runtime.js",
+            "extensions/diffs/assets/viewer-runtime.js",
+            "extensions/discord/assets/activity.js",
         ] {
             let path = worktree.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
