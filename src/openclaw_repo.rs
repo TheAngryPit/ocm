@@ -98,11 +98,7 @@ pub(crate) fn ensure_openclaw_worktree(
 
     if worktree_registered {
         if !worktree_root.exists() {
-            remove_registered_worktree(
-                &repo_root,
-                &worktree_root,
-                WorktreeCleanupPolicy::PreserveIgnoredLocalFiles,
-            )?;
+            remove_registered_worktree(&repo_root, &worktree_root)?;
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
             return Ok(worktree_root);
         } else {
@@ -155,11 +151,7 @@ pub(crate) fn remove_openclaw_worktree(
     repo_root: &Path,
     worktree_root: &Path,
 ) -> Result<(), String> {
-    remove_openclaw_worktree_with_policy(
-        repo_root,
-        worktree_root,
-        WorktreeCleanupPolicy::PreserveIgnoredLocalFiles,
-    )
+    remove_openclaw_worktree_checked(repo_root, worktree_root)
 }
 
 pub(crate) fn remove_openclaw_simulation_worktree(
@@ -176,24 +168,11 @@ pub(crate) fn remove_openclaw_simulation_worktree(
         ));
     }
 
-    remove_openclaw_worktree_with_policy(
-        repo_root,
-        worktree_root,
-        WorktreeCleanupPolicy::DiscardIgnoredLocalFiles,
-    )
+    remove_generated_simulation_outputs(worktree_root)?;
+    remove_openclaw_worktree_checked(repo_root, worktree_root)
 }
 
-#[derive(Clone, Copy)]
-enum WorktreeCleanupPolicy {
-    PreserveIgnoredLocalFiles,
-    DiscardIgnoredLocalFiles,
-}
-
-fn remove_openclaw_worktree_with_policy(
-    repo_root: &Path,
-    worktree_root: &Path,
-    cleanup_policy: WorktreeCleanupPolicy,
-) -> Result<(), String> {
+fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
     let registered = match registered_worktree_paths(repo_root) {
         Ok(registered) => registered,
         Err(_) if !worktree_root.exists() => return Ok(()),
@@ -216,15 +195,39 @@ fn remove_openclaw_worktree_with_policy(
         ));
     }
 
-    remove_registered_worktree(repo_root, worktree_root, cleanup_policy)
+    remove_registered_worktree(repo_root, worktree_root)
 }
 
-fn remove_registered_worktree(
-    repo_root: &Path,
-    worktree_root: &Path,
-    cleanup_policy: WorktreeCleanupPolicy,
-) -> Result<(), String> {
-    ensure_worktree_clean(worktree_root, cleanup_policy)?;
+fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_root)
+        .args([
+            "clean",
+            "-ffdX",
+            "--",
+            "node_modules",
+            ".artifacts",
+            "dist",
+            "dist-runtime",
+            ":(glob)packages/*/dist",
+        ])
+        .output()
+        .map_err(|error| format!("failed to remove generated simulation output: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    Err(format!(
+        "failed to remove generated simulation output: {detail}"
+    ))
+}
+
+fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
+    ensure_worktree_clean(worktree_root)?;
 
     let output = Command::new("git")
         .arg("-C")
@@ -243,10 +246,7 @@ fn remove_registered_worktree(
     Err(format!("git worktree remove failed: {detail}"))
 }
 
-fn ensure_worktree_clean(
-    worktree_root: &Path,
-    cleanup_policy: WorktreeCleanupPolicy,
-) -> Result<(), String> {
+fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
     if !worktree_root.exists() {
         return Ok(());
     }
@@ -276,12 +276,7 @@ fn ensure_worktree_clean(
         ));
     }
 
-    if matches!(
-        cleanup_policy,
-        WorktreeCleanupPolicy::PreserveIgnoredLocalFiles
-    ) {
-        ensure_no_ignored_local_files(worktree_root)?;
-    }
+    ensure_no_ignored_local_files(worktree_root)?;
     Ok(())
 }
 
@@ -647,6 +642,25 @@ mod tests {
             fs::read_to_string(worktree.join("operator-notes.txt")).unwrap(),
             "preserve\n"
         );
+    }
+
+    #[test]
+    fn simulation_cleanup_preserves_non_build_ignored_files() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        fs::write(worktree.join(".env"), "PRIVATE_VALUE=preserve\n").unwrap();
+        let generated = worktree.join("dist/index.js");
+        fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        fs::write(&generated, "generated\n").unwrap();
+
+        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        assert!(error.contains("contains ignored local files"));
+        assert_eq!(
+            fs::read_to_string(worktree.join(".env")).unwrap(),
+            "PRIVATE_VALUE=preserve\n"
+        );
+        assert!(!generated.exists());
+        assert!(worktree.exists());
     }
 
     #[cfg(unix)]
