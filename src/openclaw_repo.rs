@@ -154,7 +154,7 @@ pub(crate) fn remove_openclaw_worktree(
     remove_openclaw_worktree_checked(repo_root, worktree_root)
 }
 
-pub(crate) fn remove_openclaw_simulation_worktree(
+pub(crate) fn prepare_openclaw_simulation_worktree_cleanup(
     repo_root: &Path,
     worktree_root: &Path,
     simulation_name: &str,
@@ -169,8 +169,7 @@ pub(crate) fn remove_openclaw_simulation_worktree(
     }
 
     ensure_registered_worktree_identity(repo_root, worktree_root)?;
-    remove_generated_simulation_outputs(worktree_root)?;
-    remove_openclaw_worktree_checked(repo_root, worktree_root)
+    remove_generated_simulation_outputs(worktree_root)
 }
 
 fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
@@ -576,7 +575,7 @@ mod tests {
     use super::parse_registered_worktree_paths;
     use super::{
         ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
-        remove_openclaw_simulation_worktree, remove_openclaw_worktree,
+        prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
     };
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
@@ -645,11 +644,14 @@ mod tests {
         assert!(worktree.exists());
 
         let ownership_error =
-            remove_openclaw_simulation_worktree(&repo, &worktree, "other-sim").unwrap_err();
+            prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "other-sim")
+                .unwrap_err();
         assert!(ownership_error.contains("outside its OCM-owned worktree"));
         assert!(worktree.exists());
 
-        remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap();
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        assert!(worktree.exists());
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
         assert!(!worktree.exists());
     }
 
@@ -659,7 +661,8 @@ mod tests {
         let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
         fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
 
-        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
         assert!(error.contains("contains modified or untracked files"));
         assert_eq!(
             fs::read_to_string(worktree.join("operator-notes.txt")).unwrap(),
@@ -676,7 +679,8 @@ mod tests {
         fs::create_dir_all(generated.parent().unwrap()).unwrap();
         fs::write(&generated, "generated\n").unwrap();
 
-        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
         assert!(error.contains("contains ignored local files"));
         assert_eq!(
             fs::read_to_string(worktree.join(".env")).unwrap(),
@@ -711,7 +715,8 @@ mod tests {
             .unwrap();
         assert!(init.status.success());
 
-        let error = remove_openclaw_simulation_worktree(&repo, &worktree, "demo-sim").unwrap_err();
+        let error =
+            prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap_err();
         assert!(error.contains("not registered"));
         assert_eq!(
             fs::read_to_string(worktree.join("dist/operator-output.txt")).unwrap(),

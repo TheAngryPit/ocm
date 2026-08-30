@@ -5,7 +5,7 @@ use time::Duration;
 use time::OffsetDateTime;
 
 use super::EnvironmentService;
-use crate::openclaw_repo::remove_openclaw_simulation_worktree;
+use crate::openclaw_repo::prepare_openclaw_simulation_worktree_cleanup;
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
@@ -373,7 +373,7 @@ impl<'a> EnvironmentService<'a> {
         let _lock = self.lock_operation(name)?;
         let meta = get_environment(name, self.env, self.cwd)?;
         if let Some(dev) = meta.dev.as_ref() {
-            remove_openclaw_simulation_worktree(
+            prepare_openclaw_simulation_worktree_cleanup(
                 Path::new(&dev.repo_root),
                 Path::new(&dev.worktree_root),
                 &meta.name,
