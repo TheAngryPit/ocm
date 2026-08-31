@@ -2129,7 +2129,7 @@ impl Cli {
 
         match self
             .environment_service()
-            .remove(&summary.simulation_env, true)
+            .remove_simulation(&summary.simulation_env)
         {
             Ok(_) => {
                 summary.cleanup = "cleaned".to_string();

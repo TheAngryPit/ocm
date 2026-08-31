@@ -151,9 +151,41 @@ pub(crate) fn remove_openclaw_worktree(
     repo_root: &Path,
     worktree_root: &Path,
 ) -> Result<(), String> {
+    remove_openclaw_worktree_checked(repo_root, worktree_root)
+}
+
+pub(crate) fn prepare_openclaw_simulation_worktree_cleanup(
+    repo_root: &Path,
+    worktree_root: &Path,
+    simulation_name: &str,
+) -> Result<(), String> {
+    let expected = default_worktree_root(repo_root, simulation_name);
+    if normalize_worktree_path(worktree_root) != normalize_worktree_path(&expected) {
+        return Err(format!(
+            "refusing simulation cleanup outside its OCM-owned worktree: expected {}, found {}",
+            display_path(&expected),
+            display_path(worktree_root)
+        ));
+    }
+
+    ensure_registered_worktree_identity(repo_root, worktree_root)?;
+    remove_generated_simulation_outputs(worktree_root)
+}
+
+fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
+    if !ensure_registered_worktree_identity(repo_root, worktree_root)? {
+        return Ok(());
+    }
+    remove_registered_worktree(repo_root, worktree_root)
+}
+
+fn ensure_registered_worktree_identity(
+    repo_root: &Path,
+    worktree_root: &Path,
+) -> Result<bool, String> {
     let registered = match registered_worktree_paths(repo_root) {
         Ok(registered) => registered,
-        Err(_) if !worktree_root.exists() => return Ok(()),
+        Err(_) if !worktree_root.exists() => return Ok(false),
         Err(error) => return Err(error),
     };
     if !contains_worktree_path(&registered, worktree_root) {
@@ -163,7 +195,7 @@ pub(crate) fn remove_openclaw_worktree(
                 display_path(worktree_root)
             ));
         }
-        return Ok(());
+        return Ok(false);
     }
 
     if worktree_root.exists() && !has_expected_worktree_identity(repo_root, worktree_root) {
@@ -173,7 +205,44 @@ pub(crate) fn remove_openclaw_worktree(
         ));
     }
 
-    remove_registered_worktree(repo_root, worktree_root)
+    Ok(true)
+}
+
+fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), String> {
+    if !worktree_root.exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_root)
+        .args([
+            "clean",
+            "-ffdX",
+            "--",
+            "node_modules",
+            ":(glob)**/node_modules",
+            ".artifacts",
+            "dist",
+            "dist-runtime",
+            ":(glob)packages/*/dist",
+            "extensions/canvas/src/host/a2ui",
+            "extensions/diffs-language-pack/assets",
+            "extensions/diffs/assets",
+            "extensions/discord/assets",
+        ])
+        .output()
+        .map_err(|error| format!("failed to remove generated simulation output: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    Err(format!(
+        "failed to remove generated simulation output: {detail}"
+    ))
 }
 
 fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
@@ -493,13 +562,171 @@ fn git_path_from_bytes(path: &[u8]) -> Result<OsString, String> {
         .map_err(|_| "git returned a non-UTF-8 path".to_string())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
-    use super::{parse_legacy_registered_worktree_paths, parse_registered_worktree_paths};
+    use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use super::parse_registered_worktree_paths;
+    use super::{
+        ensure_openclaw_worktree, parse_legacy_registered_worktree_paths,
+        prepare_openclaw_simulation_worktree_cleanup, remove_openclaw_worktree,
+    };
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_openclaw_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("openclaw");
+        fs::create_dir_all(repo.join("scripts")).unwrap();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"name":"openclaw","version":"test"}"#,
+        )
+        .unwrap();
+        fs::write(repo.join("scripts/run-node.mjs"), "console.log('test');\n").unwrap();
+        fs::write(
+            repo.join(".gitignore"),
+            "node_modules/\n.artifacts/\ndist/\ndist-runtime/\npackages/*/dist/\nextensions/canvas/src/host/a2ui/\nextensions/diffs-language-pack/assets/\nextensions/diffs/assets/\nextensions/discord/assets/\n.env\n",
+        )
+        .unwrap();
+
+        let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
+        assert!(init.status.success());
+        run_git(&repo, &["config", "user.email", "tests@example.com"]);
+        run_git(&repo, &["config", "user.name", "OCM Tests"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        (temp, repo)
+    }
+
+    #[test]
+    fn simulation_cleanup_discards_ignored_outputs_only_for_owned_worktree() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        for relative in [
+            "node_modules/pkg/index.js",
+            "extensions/demo/node_modules/pkg/index.js",
+            ".artifacts/build.json",
+            "dist/index.js",
+            "dist-runtime/index.js",
+            "packages/demo/dist/index.js",
+            "extensions/canvas/src/host/a2ui/index.html",
+            "extensions/diffs-language-pack/assets/viewer-runtime.js",
+            "extensions/diffs/assets/viewer-runtime.js",
+            "extensions/discord/assets/activity.js",
+        ] {
+            let path = worktree.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "generated\n").unwrap();
+        }
+
+        let ordinary_error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+        assert!(ordinary_error.contains("contains ignored local files"));
+        assert!(worktree.exists());
+
+        let ownership_error =
+            prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "other-sim")
+                .unwrap_err();
+        assert!(ownership_error.contains("outside its OCM-owned worktree"));
+        assert!(worktree.exists());
+
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        assert!(worktree.exists());
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn simulation_cleanup_preserves_untracked_files() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
+
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+        assert!(error.contains("contains modified or untracked files"));
+        assert_eq!(
+            fs::read_to_string(worktree.join("operator-notes.txt")).unwrap(),
+            "preserve\n"
+        );
+    }
+
+    #[test]
+    fn simulation_cleanup_preserves_non_build_ignored_files() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        fs::write(worktree.join(".env"), "PRIVATE_VALUE=preserve\n").unwrap();
+        let generated = worktree.join("dist/index.js");
+        fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        fs::write(&generated, "generated\n").unwrap();
+
+        prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap();
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+        assert!(error.contains("contains ignored local files"));
+        assert_eq!(
+            fs::read_to_string(worktree.join(".env")).unwrap(),
+            "PRIVATE_VALUE=preserve\n"
+        );
+        assert!(!generated.exists());
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn simulation_cleanup_does_not_touch_replaced_unregistered_checkout() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap();
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        fs::create_dir_all(worktree.join("dist")).unwrap();
+        fs::write(worktree.join(".gitignore"), "dist/\n").unwrap();
+        fs::write(worktree.join("dist/operator-output.txt"), "preserve\n").unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let error =
+            prepare_openclaw_simulation_worktree_cleanup(&repo, &worktree, "demo-sim").unwrap_err();
+        assert!(error.contains("not registered"));
+        assert_eq!(
+            fs::read_to_string(worktree.join("dist/operator-output.txt")).unwrap(),
+            "preserve\n"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn worktree_porcelain_parser_preserves_non_utf8_paths() {
         let paths = parse_registered_worktree_paths(
