@@ -173,17 +173,19 @@ pub(crate) fn prepare_openclaw_simulation_worktree_cleanup(
 }
 
 fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
-    ensure_registered_worktree_identity(repo_root, worktree_root)?;
+    if !ensure_registered_worktree_identity(repo_root, worktree_root)? {
+        return Ok(());
+    }
     remove_registered_worktree(repo_root, worktree_root)
 }
 
 fn ensure_registered_worktree_identity(
     repo_root: &Path,
     worktree_root: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let registered = match registered_worktree_paths(repo_root) {
         Ok(registered) => registered,
-        Err(_) if !worktree_root.exists() => return Ok(()),
+        Err(_) if !worktree_root.exists() => return Ok(false),
         Err(error) => return Err(error),
     };
     if !contains_worktree_path(&registered, worktree_root) {
@@ -193,7 +195,7 @@ fn ensure_registered_worktree_identity(
                 display_path(worktree_root)
             ));
         }
-        return Ok(());
+        return Ok(false);
     }
 
     if worktree_root.exists() && !has_expected_worktree_identity(repo_root, worktree_root) {
@@ -203,7 +205,7 @@ fn ensure_registered_worktree_identity(
         ));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), String> {
