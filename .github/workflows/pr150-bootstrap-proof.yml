@@ -1,0 +1,71 @@
+name: PR150 isolated bootstrap integration proof
+on:
+  push:
+    branches: [qa/pr150-main-proof-20261011]
+    paths: [.github/workflows/pr150-bootstrap-proof.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  baseline:
+    if: github.repository == 'TheAngryPit/ocm'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      PRODUCT_SHA: 5e1ff1995a18d6f8205ab20e3d9052fdda7d8fca
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact product and workflow overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/qa/pr150-main-proof-20261011
+          test "$(git rev-parse HEAD^)" = "$PRODUCT_SHA"
+          test "$(git diff --name-only "$PRODUCT_SHA" HEAD)" = .github/workflows/pr150-bootstrap-proof.yml
+          mkdir -p proof
+          printf 'product=%s\nqa=%s\nrunner=%s/%s\n' "$PRODUCT_SHA" "$GITHUB_SHA" "$RUNNER_OS" "$RUNNER_ARCH" > proof/source.txt
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.21.0'
+          package-manager-cache: false
+      - name: Ordered development checks and focused regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version | tee proof/toolchain.txt
+          cargo --version | tee -a proof/toolchain.txt
+          node --version | tee -a proof/toolchain.txt
+          git diff --check HEAD
+          cargo fmt --check 2>&1 | tee proof/fmt.log
+          python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release*.py' 2>&1 | tee proof/release-policy.log
+          cargo check --workspace --all-targets --locked 2>&1 | tee proof/check.log
+          cargo test --locked 2>&1 | tee proof/test.log
+          cargo install --locked --path . --root "$RUNNER_TEMP/pr150-install" 2>&1 | tee proof/install.log
+          "$RUNNER_TEMP/pr150-install/bin/ocm" --version | tee proof/version.txt
+          cargo test --locked daemon_bootstrap_log_override_preserves_store_logs --lib -- --nocapture 2>&1 | tee proof/bootstrap.log
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' proof/bootstrap.log
+      - name: Verify tracked source cleanup
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code HEAD
+          git diff --cached --exit-code HEAD
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pr150-${{ matrix.os }}-${{ github.run_id }}
+          path: proof
+          if-no-files-found: error
+          retention-days: 7
