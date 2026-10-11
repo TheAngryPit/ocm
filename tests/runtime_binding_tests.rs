@@ -99,6 +99,211 @@ fn env_set_runtime_updates_and_clears_the_default_runtime() {
 }
 
 #[test]
+fn managed_backing_lock_refuses_alias_binding_until_release() {
+    let root = TestDir::new("runtime-alias-binding-lock");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let binary = cwd.join("openclaw");
+    write_executable_script(&binary, "#!/bin/sh\nprintf '2026.7.1\\n'\n");
+    let env = ocm_env(&root);
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "backing",
+            "--path",
+            binary.to_str().unwrap(),
+        ],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    let backing = ocm::store::get_runtime("backing", &env, &cwd).unwrap();
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "selected", "--path", &backing.binary_path],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let existing = run_ocm(&cwd, &env, &["env", "create", "existing"]);
+    assert!(existing.status.success(), "{}", stderr(&existing));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/runtimes/.backing.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    for (name, runtime) in [("late-alias", "selected"), ("late-direct", "backing")] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", runtime]);
+        assert!(!create.status.success());
+        assert!(
+            stderr(&create).contains("busy with another operation"),
+            "{}",
+            stderr(&create)
+        );
+        assert!(!root.child(&format!("ocm-home/envs/{name}")).exists());
+    }
+    let bind = run_ocm(&cwd, &env, &["env", "set-runtime", "existing", "selected"]);
+    assert!(!bind.status.success());
+    assert!(stderr(&bind).contains("busy with another operation"));
+    assert!(
+        ocm::store::get_environment("existing", &env, &cwd)
+            .unwrap()
+            .default_runtime
+            .is_none()
+    );
+    let peer = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "unrelated",
+            "--path",
+            binary.to_str().unwrap(),
+        ],
+    );
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    let peer = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "peer", "--runtime", "unrelated"],
+    );
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    fs2::FileExt::unlock(&lock).unwrap();
+    for (name, runtime) in [("late-alias", "selected"), ("late-direct", "backing")] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", runtime]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_clone_and_import_preserve_cyclic_bindings_with_managed_custody() {
+    for managed in [false, true] {
+        let root = TestDir::new("runtime-cycle-raw-binding");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let native = cwd.join("openclaw");
+        write_executable_script(&native, "#!/bin/sh\nprintf '2026.7.1\\n'\n");
+        let env = ocm_env(&root);
+        let ok = |args: &[&str]| {
+            let output = run_ocm(&cwd, &env, args);
+            assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+            output
+        };
+        let first = cwd.join("first");
+        let second = if managed {
+            ok(&[
+                "runtime",
+                "install",
+                "backing",
+                "--path",
+                native.to_str().unwrap(),
+            ]);
+            std::path::PathBuf::from(
+                ocm::store::get_runtime("backing", &env, &cwd)
+                    .unwrap()
+                    .binary_path,
+            )
+        } else {
+            let second = cwd.join("second");
+            fs::copy(&native, &second).unwrap();
+            second
+        };
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        ok(&[
+            "runtime",
+            "add",
+            "selected",
+            "--path",
+            first.to_str().unwrap(),
+        ]);
+        ok(&["env", "create", "source", "--runtime", "selected"]);
+        let marker = root.child("ocm-home/envs/source/durable-marker");
+        fs::write(&marker, "preserve me").unwrap();
+        ok(&["env", "clone", "source", "healthy"]);
+        let before = stdout(&ok(&["env", "show", "source", "--json"]));
+        let archive = cwd.join("source.ocm-env.tar");
+        ok(&[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ]);
+        fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        if managed {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.child("ocm-home/runtimes/.backing.lock"))
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            for args in [
+                vec!["env", "clone", "source", "blocked"],
+                vec![
+                    "env",
+                    "import",
+                    archive.to_str().unwrap(),
+                    "--name",
+                    "blocked",
+                ],
+            ] {
+                let output = run_ocm(&cwd, &env, &args);
+                assert!(!output.status.success());
+                assert!(
+                    stderr(&output).contains("busy with another operation"),
+                    "{}",
+                    stderr(&output)
+                );
+                assert!(!root.child("ocm-home/envs/blocked").exists());
+            }
+            fs2::FileExt::unlock(&lock).unwrap();
+        }
+        ok(&["env", "clone", "source", "cyclic"]);
+        ok(&[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "imported",
+        ]);
+        for name in ["cyclic", "imported"] {
+            assert_eq!(
+                ocm::store::get_environment(name, &env, &cwd)
+                    .unwrap()
+                    .default_runtime
+                    .as_deref(),
+                Some("selected")
+            );
+            assert_eq!(
+                fs::read_to_string(root.child(&format!("ocm-home/envs/{name}/durable-marker")))
+                    .unwrap(),
+                "preserve me"
+            );
+        }
+        let validated = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "validated", "--runtime", "selected"],
+        );
+        assert!(!validated.status.success());
+        assert!(!root.child("ocm-home/envs/validated").exists());
+        assert_eq!(stdout(&ok(&["env", "show", "source", "--json"])), before);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "preserve me");
+        ok(&[
+            "runtime",
+            "install",
+            "unrelated",
+            "--path",
+            native.to_str().unwrap(),
+        ]);
+    }
+}
+
+#[test]
 fn runtime_binding_and_removal_share_the_environment_registry_lock() {
     let root = TestDir::new("runtime-binding-remove-lock");
     let cwd = root.child("workspace");
