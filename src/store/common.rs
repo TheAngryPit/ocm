@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -24,13 +25,58 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }
 
+#[derive(Debug)]
 pub(crate) struct ExclusiveFileLock {
     file: File,
+    child_custody: AtomicBool,
 }
 
 impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        // An unrelated fork can retain CLOEXEC descriptors until it execs.
+        // Only deliberate child custody may extend this guard's lock lifetime.
+        if !self.child_custody.load(Ordering::Relaxed) {
+            let _ = FileExt::unlock(&self.file);
+        }
+    }
+}
+
+impl ExclusiveFileLock {
+    pub(crate) fn output(
+        &self,
+        mut command: std::process::Command,
+    ) -> std::io::Result<std::process::Output> {
+        self.retain_for_child(&mut command);
+        command.output()
+    }
+
+    pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
+        #[cfg(not(unix))]
+        let _ = command;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            // Set this before spawning and keep it on output errors too:
+            // an already-started child or descendant may still hold the lock.
+            self.child_custody.store(true, Ordering::Relaxed);
+            let fd = self.file.as_raw_fd();
+            // Only this child's copy becomes inheritable, so concurrent fleet
+            // workers and service spawns cannot retain another environment's lock across exec.
+            // SAFETY: self keeps fd open until output returns; fcntl is
+            // async-signal-safe and does not allocate after fork.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
 }
 
@@ -61,7 +107,34 @@ pub(crate) fn lock_file(path: &Path, label: &str) -> Result<ExclusiveFileLock, S
             path.display()
         )
     })?;
-    Ok(ExclusiveFileLock { file })
+    Ok(ExclusiveFileLock {
+        file,
+        child_custody: AtomicBool::new(false),
+    })
+}
+
+pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<ExclusiveFileLock>, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(ExclusiveFileLock {
+            file,
+            child_custody: AtomicBool::new(false),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!(
+            "failed to acquire {label} lock at {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLock, String> {
@@ -82,6 +155,30 @@ pub(crate) fn lock_file_shared(path: &Path, label: &str) -> Result<SharedFileLoc
         )
     })?;
     Ok(SharedFileLock { file })
+}
+
+pub(crate) fn try_lock_file_shared(
+    path: &Path,
+    label: &str,
+) -> Result<Option<SharedFileLock>, String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to open {label} lock at {}: {error}", path.display()))?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Some(SharedFileLock { file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!(
+            "failed to acquire shared {label} lock at {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
@@ -201,12 +298,12 @@ pub(crate) fn write_file_replacing_path(path: &Path, raw: &[u8]) -> Result<(), S
 }
 
 #[cfg(not(windows))]
-fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
     fs::rename(source, destination).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
-fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn replace_path(source: &Path, destination: &Path) -> Result<(), String> {
     let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
     source_wide.push(0);
     let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -260,6 +357,48 @@ mod tests {
         std::env::temp_dir()
             .join("ocm-copy-dir-tests")
             .join(format!("{label}-{}-{id}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_lock_survives_parent_guard_drop() {
+        use std::process::Command;
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+
+        let root = temp_root("inherited-lock");
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("lock");
+        let started = root.join("started");
+        let release = root.join("release");
+        struct ReleaseChild(PathBuf);
+        impl Drop for ReleaseChild {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, "");
+            }
+        }
+        let _release_child = ReleaseChild(release.clone());
+        let lock = super::lock_file(&lock_path, "test").unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "(touch \"$1\"; count=0; while [ ! -e \"$2\" ] && [ $count -lt 100 ]; do sleep 0.05; count=$((count + 1)); done) </dev/null >/dev/null 2>&1 &", "sh"])
+            .arg(&started).arg(&release);
+        assert!(lock.output(command).unwrap().status.success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "inheriting child did not start");
+            sleep(Duration::from_millis(10));
+        }
+        drop(lock);
+        assert!(super::try_lock_file(&lock_path, "test").unwrap().is_none());
+        fs::write(&release, "").unwrap();
+        loop {
+            if super::try_lock_file(&lock_path, "test").unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not release its lock");
+            sleep(Duration::from_millis(10));
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]

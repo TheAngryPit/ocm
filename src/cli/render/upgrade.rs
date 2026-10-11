@@ -1,6 +1,6 @@
 use crate::cli::upgrade::{
-    UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary, UpgradeRollbackSummary,
-    UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
+    UPGRADE_DRY_RUN_NOTES, UpgradeBatchSummary, UpgradeEnvSummary, UpgradeFleetBatchSummary,
+    UpgradeRollbackSummary, UpgradeSimulationBatchSummary, UpgradeSimulationSummary,
 };
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
@@ -79,7 +79,14 @@ pub fn upgrade_env(
                 ),
             ),
             KeyValueRow::plain(
-                "Now using",
+                if matches!(
+                    summary.outcome.as_str(),
+                    "failed" | "rolled-back" | "rollback-failed"
+                ) {
+                    "Target"
+                } else {
+                    "Now using"
+                },
                 format!("{}:{}", summary.binding_kind, summary.binding_name),
             ),
             KeyValueRow::new("OpenClaw", &summary.outcome, outcome_tone(&summary.outcome)),
@@ -117,13 +124,30 @@ pub fn upgrade_env(
         ));
     }
 
-    if let Some(note) = summary.note.as_deref() {
+    if let Some(source) = &summary.source {
         lines.push(String::new());
+        let rows = source_fields(source)
+            .into_iter()
+            .map(|(name, value)| KeyValueRow::plain(name, value))
+            .collect::<Vec<_>>();
         lines.extend(render_key_value_card(
-            "Next",
-            &[KeyValueRow::muted("Note", note)],
+            "Source observations (execution unsupported)",
+            &rows,
             profile.color,
         ));
+    }
+
+    if let Some(note) = summary.note.as_deref() {
+        lines.push(String::new());
+        if is_upgrade_preview(summary) {
+            lines.extend(upgrade_preview_notice(profile));
+        } else {
+            lines.extend(render_key_value_card(
+                "Next",
+                &[KeyValueRow::muted("Note", note)],
+                profile.color,
+            ));
+        }
     } else if matches!(
         summary.outcome.as_str(),
         "pinned" | "local-command" | "manual-runtime"
@@ -290,6 +314,24 @@ pub fn upgrade_batch(
         ],
         profile.color,
     ));
+    if summary.results.iter().any(is_upgrade_preview) {
+        lines.push(String::new());
+        lines.extend(upgrade_preview_notice(profile));
+    }
+    for result in &summary.results {
+        if let Some(source) = &result.source {
+            let rows = source_fields(source)
+                .into_iter()
+                .map(|(name, value)| KeyValueRow::plain(name, value))
+                .collect::<Vec<_>>();
+            lines.push(String::new());
+            lines.extend(render_key_value_card(
+                &format!("{} source (execution unsupported)", result.env_name),
+                &rows,
+                profile.color,
+            ));
+        }
+    }
     if !wide {
         lines.push(String::new());
         lines.push(paint(
@@ -625,6 +667,18 @@ pub fn upgrade_simulation_batch(
     lines
 }
 
+fn is_upgrade_preview(summary: &UpgradeEnvSummary) -> bool {
+    matches!(summary.outcome.as_str(), "would-switch" | "would-update")
+}
+
+fn upgrade_preview_notice(profile: RenderProfile) -> Vec<String> {
+    // Essential preview limits must survive narrow cards and omitted table columns.
+    UPGRADE_DRY_RUN_NOTES
+        .iter()
+        .map(|note| paint(note, Tone::Warning, profile.color))
+        .collect()
+}
+
 fn upgrade_env_raw(summary: &UpgradeEnvSummary) -> Vec<String> {
     let mut bits = vec![
         summary.env_name.clone(),
@@ -653,7 +707,65 @@ fn upgrade_env_raw(summary: &UpgradeEnvSummary) -> Vec<String> {
     if let Some(note) = summary.note.as_deref() {
         bits.push(format!("note={note}"));
     }
+    if let Some(source) = &summary.source {
+        bits.extend(
+            source_fields(source)
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+    }
     vec![bits.join("  ")]
+}
+
+fn source_fields(
+    source: &crate::cli::upgrade::source::SourceInspection,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("sourceRoot", source.root.clone()),
+        (
+            "sourceHead",
+            source.head.clone().unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "builtCommit",
+            source
+                .built_commit
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "builtVersion",
+            source
+                .built_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "buildMatchesHead",
+            source
+                .build_matches_head
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        ),
+        (
+            "workingTreeClean",
+            source
+                .working_tree_clean
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        ),
+    ];
+    if let Some(tracking) = &source.tracking_ref {
+        fields.push(("trackingRef", tracking.clone()));
+    }
+    if let Some(head) = &source.tracking_head {
+        fields.push(("trackingHead", head.clone()));
+    }
+    if !source.shared_environments.is_empty() {
+        fields.push(("sharedEnvironments", source.shared_environments.join(", ")));
+    }
+    if !source.issues.is_empty() {
+        fields.push(("sourceIssues", source.issues.join("; ")));
+    }
+    fields
 }
 
 fn upgrade_rollback_raw(summary: &UpgradeRollbackSummary) -> Vec<String> {
@@ -800,7 +912,7 @@ fn upgrade_simulation_batch_raw(summary: &UpgradeSimulationBatchSummary) -> Vec<
 
 fn outcome_tone(outcome: &str) -> Tone {
     match outcome {
-        "updated" | "switched" => Tone::Success,
+        "updated" | "source-updated" | "switched" => Tone::Success,
         "would-update" | "would-switch" => Tone::Accent,
         "up-to-date" => Tone::Accent,
         "pinned" | "local-command" | "manual-runtime" => Tone::Warning,

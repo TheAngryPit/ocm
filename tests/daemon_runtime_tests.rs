@@ -2,13 +2,14 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::{Ipv4Addr, TcpListener};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use ocm::env::{CreateEnvSnapshotOptions, EnvironmentService};
 use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
@@ -221,9 +222,23 @@ if [ "${{1:-}}" = "gateway" ] && [ "${{2:-}}" = "status" ]; then
   exit 0
 fi
 if [ "${{1:-}}" = "gateway" ]; then
-  trap 'printf "%s\n" "$$" >> "{stopped}"; exit 0' TERM INT
   printf '%s\n' "$$" >> '{started}'
-  while :; do sleep 3600; done
+  exec node - "${{4:-0}}" '{stopped}' <<'NODE'
+const http = require('node:http');
+const fs = require('node:fs');
+const port = Number(process.argv[2]);
+const stop = () => {{
+  fs.appendFileSync(process.argv[3], `${{process.pid}}\n`);
+  process.exit(0);
+}};
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+const server = http.createServer((request, response) => {{
+  response.writeHead(request.url === '/health' ? 200 : 404);
+  response.end(request.url === '/health' ? 'ok' : 'not found');
+}});
+server.listen(port, '127.0.0.1');
+NODE
 fi
 case "${{1:-}}" in
   --version)
@@ -441,6 +456,7 @@ fn write_self_refreshing_gateway_script(
     refresh_pid_path: &Path,
     refresh_output_path: &Path,
     process_groups_path: &Path,
+    ocm: &Path,
 ) {
     let refresh_launcher = path.with_extension("refresh-ocm");
     write_executable_script(
@@ -453,7 +469,7 @@ printf 'gateway_pid=%s gateway_pgid=%s refresh_pid=%s refresh_pgid=%s\n' \
 exec '{ocm}' "$@"
 "#,
             process_groups_path = path_string(process_groups_path),
-            ocm = path_string(&ocm_test_binary_path()),
+            ocm = path_string(ocm),
         ),
     );
     write_executable_script(
@@ -1243,10 +1259,6 @@ fn gateway_owned_upgrade_survives_its_source_process_group() {
     );
     install_fake_service_manager(&root, &mut env);
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let gateway_port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
-
     let old_started = root.child("old-started");
     let new_started = root.child("new-started");
     let upgrade_pid_path = root.child("upgrade-pid");
@@ -1284,18 +1296,11 @@ exec '{ocm}' "$@"
         );
         assert!(add.status.success(), "{}", stderr(&add));
     }
+    // Let creation select an available OpenClaw port family.
     let create = run_ocm(
         &cwd,
         &env,
-        &[
-            "env",
-            "create",
-            "self",
-            "--runtime",
-            "old-runtime",
-            "--port",
-            &gateway_port,
-        ],
+        &["env", "create", "self", "--runtime", "old-runtime"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
     set_service_enabled(&cwd, &env, "self", true);
@@ -1372,6 +1377,17 @@ exec '{ocm}' "$@"
 #[cfg(unix)]
 #[test]
 fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
+    gateway_owned_daemon_refresh(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn npm_gateway_owned_daemon_refresh_survives_its_source_process_group() {
+    gateway_owned_daemon_refresh(true);
+}
+
+#[cfg(unix)]
+fn gateway_owned_daemon_refresh(npm: bool) {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("gateway-owned-daemon-refresh");
     let cwd = root.child("workspace");
@@ -1391,16 +1407,22 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
         &replacement_daemon_pid_path,
     );
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let gateway_port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
-
     let started_path = root.child("gateway-started");
     let refresh_gate_path = root.child("refresh-gate");
     let refresh_pid_path = root.child("refresh-pid");
     let refresh_output_path = root.child("refresh-output");
     let process_groups_path = root.child("process-groups");
     let runtime_path = root.child("bin/openclaw");
+    let ocm = if npm {
+        let Some((entrypoint, _)) =
+            crate::support::npm_fixture(&root.child("prefix/lib/node_modules/@openclaw/ocm"))
+        else {
+            return;
+        };
+        entrypoint
+    } else {
+        ocm_test_binary_path()
+    };
     write_self_refreshing_gateway_script(
         &runtime_path,
         &started_path,
@@ -1408,6 +1430,7 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
         &refresh_pid_path,
         &refresh_output_path,
         &process_groups_path,
+        &ocm,
     );
 
     let add = run_ocm(
@@ -1422,18 +1445,11 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
         ],
     );
     assert!(add.status.success(), "{}", stderr(&add));
+    // Let creation select an available OpenClaw port family.
     let create = run_ocm(
         &cwd,
         &env,
-        &[
-            "env",
-            "create",
-            "self",
-            "--runtime",
-            "managed",
-            "--port",
-            &gateway_port,
-        ],
+        &["env", "create", "self", "--runtime", "managed"],
     );
     assert!(create.status.success(), "{}", stderr(&create));
     set_service_enabled(&cwd, &env, "self", true);
@@ -1471,11 +1487,16 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut contract_met = false;
+    let mut daemon_status = None;
     while Instant::now() < deadline {
+        // This test owns the old daemon. Reap it so fake launchctl's kill -0
+        // observes its exit instead of polling a zombie through every retry.
+        daemon_status = daemon.try_wait().unwrap();
         let calls = fs::read_to_string(root.child("refresh-launchctl.log")).unwrap_or_default();
         let output = fs::read_to_string(&refresh_output_path).unwrap_or_default();
         let starts = fs::read_to_string(&started_path).unwrap_or_default();
-        contract_met = calls.lines().any(|line| line.starts_with("bootstrap "))
+        contract_met = daemon_status.is_some_and(|status| status.success())
+            && calls.lines().any(|line| line.starts_with("bootstrap "))
             && output.contains("\"action\": \"refresh\"")
             && starts.lines().count() >= 2;
         if contract_met {
@@ -1490,11 +1511,13 @@ fn gateway_owned_daemon_refresh_survives_its_source_process_group() {
     if let Ok(pid) = fs::read_to_string(&replacement_daemon_pid_path) {
         let _ = Command::new("kill").args(["-INT", pid.trim()]).status();
     }
-    stop_process(&mut daemon);
+    if daemon_status.is_none() {
+        stop_process(&mut daemon);
+    }
 
     assert!(
         contract_met,
-        "gateway-owned daemon refresh did not complete and restart the Gateway\nprocess-groups={process_groups}\nlaunchctl-calls={calls}\nrefresh-output={output}\ngateway-starts={starts}"
+        "gateway-owned daemon refresh did not complete and restart the Gateway\nold-daemon-exit={daemon_status:?}\nprocess-groups={process_groups}\nlaunchctl-calls={calls}\nrefresh-output={output}\ngateway-starts={starts}"
     );
 }
 
@@ -1745,6 +1768,202 @@ fn service_state_plans_runnable_children_and_skips_disabled_envs() {
 }
 
 #[test]
+fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-source-watch-exclusion");
+    let (cwd, env, launcher_marker, runtime_marker) =
+        setup_daemon_run_fixture_with_child_sleep(&root, 30);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+    let watch_path = root.child("ocm-home/source-watch/demo.lock");
+    fs::create_dir_all(watch_path.parent().unwrap()).unwrap();
+    let mut source_watch = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(watch_path)
+        .unwrap();
+    FileExt::lock_exclusive(&source_watch).unwrap();
+    writeln!(source_watch, "starting-lease").unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    // The supervisor publishes the PID before the child's first write completes.
+    let sibling_was_started = wait_for_file(&runtime_marker, Duration::from_secs(5));
+    let source_was_started = launcher_marker.exists();
+    drop(source_watch);
+    let after = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    let source_was_resumed = wait_for_file(&launcher_marker, Duration::from_secs(5));
+    stop_process(&mut daemon);
+
+    assert!(during.is_some(), "unwatched sibling should remain runnable");
+    assert!(!source_was_started, "saved plan started the watched env");
+    assert!(sibling_was_started);
+    assert!(
+        after.is_some(),
+        "service did not resume after watch released"
+    );
+    assert!(
+        source_was_resumed,
+        "resumed child did not write its startup marker"
+    );
+}
+
+#[test]
+fn contended_admission_preserves_sibling_supervision_and_desired_starts() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-admission-contention");
+    let (cwd, env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let supervisor = SupervisorService::new(&env, &cwd);
+    supervisor.sync().unwrap();
+    let admission_path = root.child("ocm-home/source-watch/demo.admission");
+    fs::create_dir_all(admission_path.parent().unwrap()).unwrap();
+    let hold_admission = || {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&admission_path)
+            .unwrap();
+        FileExt::lock_exclusive(&file).unwrap();
+        file
+    };
+
+    let admission = hold_admission();
+    let plan = to_value(supervisor.plan().unwrap()).unwrap();
+    assert_eq!(plan["children"].as_array().unwrap().len(), 2);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    let source_was_started = launcher_marker.exists();
+    drop(admission);
+    let resumed =
+        wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+
+    let admission = hold_admission();
+    let restart = supervisor.request_child_restart("demo");
+    let deferred_restart =
+        wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    let signal = Command::new("kill")
+        .args(["-INT", &daemon.id().to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let graceful = loop {
+        if daemon.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(25));
+    };
+    drop(admission);
+    if !graceful {
+        stop_process(&mut daemon);
+    }
+
+    assert!(
+        during.is_some(),
+        "contention prevented the sibling from starting"
+    );
+    assert!(
+        !source_was_started,
+        "contended env started without admission"
+    );
+    assert!(resumed.is_some(), "contention discarded the desired start");
+    assert!(restart.is_ok(), "{}", restart.unwrap_err());
+    assert!(
+        deferred_restart.is_some(),
+        "contended restart stopped sibling supervision"
+    );
+    assert!(signal.is_ok_and(|status| status.success()));
+    assert!(graceful, "admission contention blocked daemon shutdown");
+}
+
+#[test]
+fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-spawn-publication");
+    let (cwd, mut env, launcher_marker, _) = setup_daemon_run_fixture_with_child_sleep(&root, 60);
+    install_fake_service_manager(&root, &mut env);
+    let probe_started = root.child("probe-started");
+    let probe_release = root.child("probe-release");
+    let slow_script = root.child("slow/openclaw.mjs");
+    write_executable_script(
+        &slow_script,
+        &format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart-handoff ]; then\n  printf 'ready\\n' > '{}'\n  while [ ! -f '{}' ]; do /bin/sleep 0.01; done\n  exit 64\nfi\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+            path_string(&probe_started),
+            path_string(&probe_release),
+        ),
+    );
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "slow",
+            "--command",
+            &path_string(&slow_script),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    EnvironmentService::new(&env, &cwd)
+        .set_launcher("prod", "slow")
+        .unwrap();
+    let install = run_ocm(&cwd, &env, &["service", "install", "prod"]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    EnvironmentService::new(&env, &cwd)
+        .set_service_running("prod", true)
+        .unwrap();
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let probe_is_blocked = wait_for_file(&probe_started, Duration::from_secs(10));
+    let first_child_started = wait_for_file(&launcher_marker, Duration::from_secs(5));
+    let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    let sibling_status = run_ocm(&cwd, &env, &["service", "status", "prod", "--json"]);
+    let runtime =
+        fs::read_to_string(root.child("ocm-home/supervisor/runtime.json")).unwrap_or_default();
+    let admission = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/source-watch/demo.admission"))
+        .unwrap();
+    let admission_available = FileExt::try_lock_exclusive(&admission).is_ok();
+    fs::write(&probe_release, "release\n").unwrap();
+    drop(admission);
+    stop_process(&mut daemon);
+
+    assert!(
+        probe_is_blocked,
+        "sibling did not reach the controlled probe"
+    );
+    assert!(first_child_started, "first gateway did not start");
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert!(
+        sibling_status.status.success(),
+        "{}",
+        stderr(&sibling_status)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["running"], true,
+        "service stop could not observe the started gateway; status={status}; runtime={runtime}"
+    );
+    assert!(status["childPid"].as_u64().is_some());
+    assert!(
+        admission_available,
+        "sibling probe retained another env's admission"
+    );
+    let sibling_status: Value = serde_json::from_slice(&sibling_status.stdout).unwrap();
+    assert_eq!(sibling_status["gatewayState"], "pending");
+}
+
+#[test]
 fn daemon_run_persists_live_runtime_children() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-runtime-state");
@@ -1757,6 +1976,8 @@ fn daemon_run_persists_live_runtime_children() {
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let runtime = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(5))
         .expect("daemon runtime state did not report running children");
+    let daemon_pid = daemon.id();
+    let gateway_admission = runtime["gatewayAdmission"].clone();
     assert_eq!(runtime["kind"], "ocm-supervisor-runtime");
     assert_eq!(runtime["daemonVersion"], env!("CARGO_PKG_VERSION"));
 
@@ -1770,6 +1991,14 @@ fn daemon_run_persists_live_runtime_children() {
     let cleared = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
         .expect("daemon runtime state did not clear after shutdown");
     assert!(cleared["updatedAt"].as_str().is_some());
+    assert_eq!(gateway_admission["version"], 11);
+    assert_eq!(gateway_admission["process"]["pid"], daemon_pid);
+    assert!(
+        gateway_admission["process"]["startedAt"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(cleared["gatewayAdmission"], gateway_admission);
 }
 
 #[test]
@@ -1797,6 +2026,7 @@ fn daemon_run_once_executes_planned_children() {
 
     assert_eq!(fs::read_to_string(launcher_marker).unwrap(), "launcher\n");
     assert_eq!(fs::read_to_string(runtime_marker).unwrap(), "runtime\n");
+    assert!(!root.child("ocm-home/supervisor/runtime.json").exists());
 }
 
 #[test]
@@ -1924,6 +2154,52 @@ fn start_create_preserves_running_siblings_despite_caller_environment_drift() {
     );
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn service_policy_changes_preserve_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-policy-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+    let sibling = persisted_child(&state_path, "prod");
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+
+    // Simulation repeats an already-disabled policy; that must remain target-scoped too.
+    for (enabled_option, running_option, enabled, running) in [
+        (Some(false), None, false, true),
+        (None, Some(false), false, false),
+        (Some(false), Some(false), false, false),
+        (Some(true), None, true, false),
+        (None, Some(true), true, true),
+        (Some(true), Some(true), true, true),
+    ] {
+        let service = EnvironmentService::new(&env, &cwd);
+        let changed = match (enabled_option, running_option) {
+            (Some(enabled), None) => service.set_service_enabled("demo", enabled),
+            (None, Some(running)) => service.set_service_running("demo", running),
+            _ => service.set_service_policy("demo", enabled_option, running_option),
+        }
+        .unwrap();
+        assert_eq!(changed.service_enabled, enabled);
+        assert_eq!(changed.service_running, running);
+        assert_eq!(
+            persisted_child(&state_path, "prod"),
+            sibling,
+            "changing one environment's service policy rebuilt a sibling definition"
+        );
+        let state = read_persisted_service_state(&state_path);
+        let target_present = state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["envName"] == "demo");
+        assert_eq!(target_present, enabled && running);
+    }
 }
 
 #[test]
@@ -2602,6 +2878,15 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
+    env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    env.insert(
+        "XDG_RUNTIME_DIR".into(),
+        path_string(&root.child("daemon-session")),
+    );
+    env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/daemon-session/bus".into(),
+    );
     env.insert(
         "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
         "launchd".to_string(),
@@ -2615,7 +2900,10 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         let runtime = root.child(format!("bin/{runtime_name}"));
         write_legacy_openclaw_script(
             &runtime,
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"${{OPENCLAW_OCM_UPDATE_PROTOCOL-unset}}\" \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                root.child(format!("{env_name}-scope")).display()
+            ),
         );
         let add = run_ocm(
             &cwd,
@@ -2645,18 +2933,47 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         "fixture must report the managed daemon as running: {daemon_status:?}"
     );
 
+    let mut legacy_state = read_persisted_service_state(&state_path);
+    for child in legacy_state["children"].as_array_mut().unwrap() {
+        child["processEnv"]["OCM_SELF"] = Value::String("/retired/caller/ocm".into());
+        child["processEnv"]["OPENCLAW_OCM_UPDATE_PROTOCOL"] = Value::String("stale".into());
+    }
+    write_persisted_service_state(&state_path, &legacy_state);
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
         .expect("daemon runtime state did not report both children");
     let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+    let scope_path = root.child("target-scope");
+    assert!(wait_for_file(&scope_path, Duration::from_secs(5)));
+    let scope = fs::read_to_string(&scope_path).unwrap();
+    let scope: Vec<_> = scope.lines().collect();
+    assert_eq!(
+        fs::canonicalize(scope[0]).unwrap(),
+        fs::canonicalize(support::ocm_test_binary_path()).unwrap()
+    );
+    assert_eq!(scope[1], env["OCM_HOME"]);
+    assert_eq!(scope[2], "unset");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(scope[3], env["XDG_RUNTIME_DIR"]);
+        assert_eq!(scope[4], env["DBUS_SESSION_BUS_ADDRESS"]);
+    }
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
     sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
     write_persisted_service_state(&sibling_meta_path, &sibling_meta);
 
-    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    let mut caller_env = env.clone();
+    caller_env.insert("OCM_SELF".into(), "/another/caller/ocm".into());
+    caller_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    caller_env.insert("XDG_RUNTIME_DIR".into(), "/another/caller/session".into());
+    caller_env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/another/caller/bus".into(),
+    );
+    let start = run_ocm(&cwd, &caller_env, &["service", "start", "target", "--json"]);
     assert!(start.status.success(), "{}", stderr(&start));
     sleep(Duration::from_millis(800));
 
@@ -3038,6 +3355,333 @@ fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child(
     stop_process(&mut daemon);
 }
 
+// Own cleanup even when a regression assertion fails while a sibling stays live.
+struct InactiveGatewayFixture {
+    daemon: Child,
+    root: TestDir,
+    cwd: std::path::PathBuf,
+    env: BTreeMap<String, String>,
+    runtime_path: std::path::PathBuf,
+    sibling: Value,
+}
+
+impl Drop for InactiveGatewayFixture {
+    fn drop(&mut self) {
+        let _ = fs::write(self.root.child("release-consume"), "release");
+        stop_process(&mut self.daemon);
+    }
+}
+
+impl InactiveGatewayFixture {
+    fn new() -> Self {
+        let fixture = Self::running(false);
+        fixture.exit_target();
+        fixture
+    }
+
+    fn running(block_consume: bool) -> Self {
+        let root = TestDir::new("inactive-gateway-reconcile");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        install_fake_systemd_tools(&root, &mut env);
+        for name in ["target", "sibling"] {
+            let runtime = root.child(format!("bin/{name}/openclaw.mjs"));
+            write_upgrade_aware_gateway_script(
+                &runtime,
+                "2026.8.1",
+                &root.child(format!("{name}-started")),
+                &root.child(format!("{name}-stopped")),
+                false,
+            );
+            if name == "target" && block_consume {
+                let protocol = format!(
+                    r#"if [ "${{3:-}}" = "capabilities" ]; then
+  printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"operations":["consume"]}}'
+  exit 0
+fi
+printf 'waiting\n' > '{}'
+for attempt in $(seq 1 200); do
+  if [ -f '{}' ]; then
+    printf '%s\n' '{{"ok":true,"protocol":"openclaw.gateway.restart-handoff","protocolVersion":1,"status":"none","reason":"missing"}}'
+    exit 0
+  fi
+  sleep 0.025
+done
+exit 65"#,
+                    path_string(&root.child("consume-waiting")),
+                    path_string(&root.child("release-consume")),
+                );
+                let script = fs::read_to_string(&runtime)
+                    .unwrap()
+                    .replacen("exit 64", &protocol, 1);
+                write_executable_script(&runtime, &script);
+            }
+            let added = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&runtime)],
+            );
+            assert!(added.status.success(), "{}", stderr(&added));
+            let created = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", name]);
+            assert!(created.status.success(), "{}", stderr(&created));
+        }
+        let service = SupervisorService::new(&env, &cwd);
+        service.sync().unwrap();
+        service.install_daemon().unwrap();
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let daemon = spawn_daemon_process(&cwd, &env);
+        let mut fixture = Self {
+            daemon,
+            root,
+            cwd,
+            env,
+            runtime_path,
+            sibling: Value::Null,
+        };
+        for name in ["target", "sibling"] {
+            let started = run_ocm(
+                &fixture.cwd,
+                &fixture.env,
+                &["service", "start", name, "--json"],
+            );
+            assert!(started.status.success(), "{}", stderr(&started));
+        }
+        let initial = read_persisted_service_state(&fixture.runtime_path);
+        fixture.sibling = runtime_child(&initial, "sibling");
+        fixture
+    }
+
+    fn signal_target(&self) {
+        let runtime = read_persisted_service_state(&self.runtime_path);
+        let pid = runtime_child_pid(&runtime, "target").unwrap();
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn exit_target(&self) {
+        // Snapshot restoration publishes the child before its signal handlers
+        // and HTTP listener are ready. Wait through the public health contract.
+        let ready = run_ocm(
+            &self.cwd,
+            &self.env,
+            &["service", "start", "target", "--json"],
+        );
+        assert!(ready.status.success(), "{}", stderr(&ready));
+        self.signal_target();
+        let stopped = wait_for_runtime_service_state(
+            &self.runtime_path,
+            "target",
+            "stopped",
+            Duration::from_secs(5),
+        )
+        .expect("clean exit must reach the terminal inactive state");
+        assert_eq!(stopped["pid"], Value::Null);
+        assert_eq!(stopped["lastExitCode"], 0);
+    }
+}
+
+#[test]
+fn sibling_restart_preserves_inactive_target_until_explicit_restart() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::new();
+    let target_state = wait_for_runtime_service_state(
+        &fixture.runtime_path,
+        "target",
+        "stopped",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let state_path = fixture.root.child("ocm-home/supervisor/state.json");
+    let target_spec = persisted_child(&state_path, "target");
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "sibling", "--force", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert_ne!(
+        runtime_child(&runtime, "sibling")["pid"],
+        fixture.sibling["pid"]
+    );
+    assert!(runtime_child_pid(&runtime, "target").is_none());
+    assert_eq!(persisted_child(&state_path, "target"), target_spec);
+    assert_eq!(
+        runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "target"),
+        Some(&target_state)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.child("target-started"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let restart = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "restart", "target", "--force", "--json"],
+    );
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    let restarted = read_persisted_service_state(&fixture.runtime_path);
+    assert!(runtime_child_pid(&restarted, "target").is_some());
+    assert_eq!(
+        runtime_child(&restarted, "sibling"),
+        runtime_child(&runtime, "sibling")
+    );
+}
+
+#[test]
+fn snapshot_retires_inactive_target_and_preserves_running_sibling() {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::new();
+    let snapshot = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &[
+            "env", "snapshot", "create", "target", "--label", "inactive", "--json",
+        ],
+    );
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+    let runtime = read_persisted_service_state(&fixture.runtime_path);
+    assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+    assert!(
+        runtime_child_pid(&runtime, "target").is_some(),
+        "snapshot must restore the target's running policy"
+    );
+
+    fixture.exit_target();
+    let stopped = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["service", "stop", "target", "--json"],
+    );
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let runtime = read_persisted_service_state(&fixture.runtime_path);
+        assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+        if runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["envName"] != "target")
+        {
+            assert!(runtime_child_pid(&runtime, "target").is_none());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stopped target retained inactive ownership metadata"
+        );
+        sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn inactive_exit_decision_survives_concurrent_sibling_restart() {
+    assert_inactive_exit_reconciliation(false);
+}
+
+#[test]
+fn inactive_exit_decision_is_retired_after_concurrent_stop() {
+    assert_inactive_exit_reconciliation(true);
+}
+
+fn assert_inactive_exit_reconciliation(remove_target: bool) {
+    let _guard = daemon_runtime_test_lock();
+    let fixture = InactiveGatewayFixture::running(true);
+    fixture.signal_target();
+    assert!(wait_for_file(
+        &fixture.root.child("consume-waiting"),
+        Duration::from_secs(5)
+    ));
+    let cwd = fixture.cwd.clone();
+    let env = fixture.env.clone();
+    let operation = std::thread::spawn(move || {
+        let args = if remove_target {
+            vec!["service", "stop", "target", "--json"]
+        } else {
+            vec!["service", "restart", "sibling", "--force", "--json"]
+        };
+        run_ocm(&cwd, &env, &args)
+    });
+    let state_path = fixture.root.child("ocm-home/supervisor/state.json");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let state = read_persisted_service_state(&state_path);
+        let published = if remove_target {
+            state["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["envName"] != "target")
+        } else {
+            state["restartRequests"].as_array().is_some_and(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request["envName"] == "sibling")
+            })
+        };
+        if published {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CLI did not publish its desired-state update"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    fs::write(fixture.root.child("release-consume"), "release").unwrap();
+    let result = operation.join().unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let runtime = read_persisted_service_state(&fixture.runtime_path);
+        let target = runtime["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["envName"] == "target");
+        let reconciled = if remove_target {
+            target.is_none()
+        } else {
+            target.is_some_and(|entry| entry["gatewayState"] == "stopped" && entry["pid"].is_null())
+        };
+        if reconciled {
+            assert!(runtime_child_pid(&runtime, "target").is_none());
+            if remove_target {
+                assert_eq!(runtime_child(&runtime, "sibling"), fixture.sibling);
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "concurrent plan update lost the terminal exit decision: {runtime}"
+        );
+        sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.root.child("target-started"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn service_restart_requeues_a_stopped_desired_child() {
     let _guard = daemon_runtime_test_lock();
@@ -3122,6 +3766,112 @@ fn service_start_and_restart_wait_for_gateway_health() {
 }
 
 #[test]
+fn service_restart_collects_native_helper_rejection_before_readiness() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-restart-helper-result");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let script = root.child("bin/readiness-openclaw.mjs");
+    let control = root.child("restart-control.json");
+    let raw = fs::read_to_string(&script).unwrap();
+    // Keep the real health endpoint and daemon, replacing only the native
+    // OpenClaw protocol with controlled acceptance and rejection responses.
+    let raw = raw.replace(
+        "import http from 'node:http';",
+        &format!(
+            "import http from 'node:http';\nimport fs from 'node:fs';\nconst control = {};",
+            serde_json::to_string(&path_string(&control)).unwrap()
+        ),
+    );
+    let raw = raw.replace(
+        "  process.exit(64);",
+        r#"  const protocol = {ok: true, protocol: 'openclaw.gateway.restart-handoff', protocolVersion: 1};
+  if (args[2] === 'capabilities') {
+    console.log(JSON.stringify({...protocol, operations: ['consume']}));
+  } else {
+    const handoff = JSON.parse(fs.readFileSync(control, 'utf8'));
+    console.log(JSON.stringify({...protocol, status: 'accepted', handoff: {pid: handoff.pid, supervisorMode: 'external'}}));
+  }
+  process.exit(0);"#,
+    );
+    let raw = raw.replace(
+        "const portIndex = args.indexOf('--port');",
+        r#"if (args[0] === 'gateway' && args[1] === 'restart') {
+  const request = JSON.parse(fs.readFileSync(control, 'utf8'));
+  setTimeout(() => {
+    if (request.replace) process.kill(request.pid, 'SIGTERM');
+    process.exit(request.code);
+  }, request.delay);
+  await new Promise(() => {});
+}
+process.on('SIGTERM', () => process.exit(0));
+const portIndex = args.indexOf('--port');"#,
+    );
+    let native_script = root.child("bin/openclaw.mjs");
+    write_executable_script(&native_script, &raw);
+    for args in [
+        vec![
+            "launcher",
+            "add",
+            "native",
+            "--command",
+            native_script.to_str().unwrap(),
+        ],
+        vec!["env", "set-launcher", "demo", "native"],
+    ] {
+        let configured = run_ocm(&cwd, &env, &args);
+        assert!(configured.status.success(), "{}", stderr(&configured));
+    }
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let initial = read_persisted_service_state(&runtime_path);
+        let original_pid = runtime_child_pid(&initial, "demo").unwrap();
+        assert_eq!(initial["services"][0]["restartHandoff"], "protocol-v1");
+        for delay in [0, 1000] {
+            fs::write(
+                &control,
+                serde_json::json!({"delay": delay, "code": 23, "replace": false}).to_string(),
+            )
+            .unwrap();
+            let rejected = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+            assert!(!rejected.status.success(), "{}", stdout(&rejected));
+            assert!(stderr(&rejected).contains("rejected the recovery-aware restart"));
+            assert!(stderr(&rejected).contains("exit code 23"));
+            let current = read_persisted_service_state(&runtime_path);
+            assert_eq!(
+                runtime_child(&current, "demo"),
+                runtime_child(&initial, "demo")
+            );
+            let ready = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+            assert!(ready.status.success(), "{}", stderr(&ready));
+            let body: Value = serde_json::from_slice(&ready.stdout).unwrap();
+            assert_eq!(body["gatewayReady"], true);
+        }
+        fs::write(
+            &control,
+            serde_json::json!({"delay": 1000, "code": 0, "replace": true, "pid": original_pid})
+                .to_string(),
+        )
+        .unwrap();
+        let accepted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+        assert!(accepted.status.success(), "{}", stderr(&accepted));
+        let body: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+        assert_eq!(body["gatewayReady"], true);
+        assert_ne!(
+            runtime_child_pid(&read_persisted_service_state(&runtime_path), "demo"),
+            Some(original_pid)
+        );
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
 fn service_start_waits_for_slow_gateway_health() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-slow");
@@ -3136,6 +3886,78 @@ fn service_start_waits_for_slow_gateway_health() {
     assert_eq!(body["gatewayReady"], true);
 
     stop_process(&mut daemon);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_start_preserves_exec_and_plain_executable_launchers() {
+    let _guard = daemon_runtime_test_lock();
+    for mode in ["quoted", "unquoted", "plain"] {
+        let root = TestDir::new("service-readiness-exec");
+        let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+        let script = root.child("bin/readiness-openclaw.mjs");
+        let entry = root.child("Entrypoint With Spaces.mjs");
+        std::os::unix::fs::symlink(&script, &entry).unwrap();
+        let recipe = match mode {
+            "quoted" => format!("exec \"node\" '{}'", path_string(&entry)),
+            "unquoted" => format!("exec {}", path_string(&script)),
+            _ => path_string(&script),
+        };
+        let launcher = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "candidate",
+                "--command",
+                &recipe,
+                "--cwd",
+                &path_string(&cwd),
+            ],
+        );
+        assert!(launcher.status.success(), "{}", stderr(&launcher));
+        let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "candidate"]);
+        assert!(bound.status.success(), "{}", stderr(&bound));
+
+        let mut daemon = spawn_daemon_process(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        let runtime: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/supervisor/runtime.json")).unwrap_or_default(),
+        )
+        .unwrap_or(Value::Null);
+        let pid = runtime["children"][0]["pid"].as_u64().map(|pid| pid as u32);
+        let child_was_alive = pid.is_some_and(process_exists);
+        // Reap the isolated supervisor and its child even if readiness failed.
+        stop_process(&mut daemon);
+        assert!(
+            started.status.success(),
+            "{mode}: {}\n{}",
+            stdout(&started),
+            stderr(&started)
+        );
+        let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+        assert_eq!(body["gatewayReady"], true, "{mode}");
+        assert_eq!(body["gatewayState"], "running", "{mode}");
+        assert!(child_was_alive, "{mode}: no live supervised Gateway PID");
+        assert!(
+            !process_exists(pid.unwrap()),
+            "{mode}: Gateway survived stop"
+        );
+
+        let child = persisted_child(&root.child("ocm-home/supervisor/state.json"), "demo");
+        assert_eq!(child["runDir"], path_string(&cwd));
+        assert!(
+            std::env::split_paths(child["processEnv"]["PATH"].as_str().unwrap())
+                .all(|path| !path.join("exec").is_file()),
+            "fixture must not provide an external exec command"
+        );
+        if mode == "plain" {
+            assert_eq!(child["binaryPath"], path_string(&script));
+        } else {
+            assert!(child["binaryPath"].is_null(), "{mode}");
+        }
+    }
 }
 
 #[test]

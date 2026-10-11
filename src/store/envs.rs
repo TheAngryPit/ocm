@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +13,6 @@ use crate::infra::archive::{
     ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_with_options,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -22,6 +21,7 @@ use std::os::unix::fs::DirBuilderExt;
 use super::common::{
     copy_dir_recursive, copy_path, ensure_dir, path_exists, read_json, write_json,
 };
+use super::dev_sources::ensure_root_outside_dev_sources;
 use super::gateway_ports::{
     DEFAULT_GATEWAY_PORT, choose_available_gateway_port, resolve_effective_gateway_ports,
     resolve_env_gateway_port,
@@ -31,8 +31,9 @@ use super::layout::{
     resolve_absolute_path, resolve_store_paths, validate_name,
 };
 use super::now_utc;
+use super::openclaw_state::validate_nonportable_runtime_state_paths;
 use super::{
-    OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
+    DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
     openclaw_config_uses_includes, openclaw_env_archive_options,
     reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
@@ -69,11 +70,12 @@ fn empty_env_registry() -> EnvRegistry {
 
 fn load_env_registry(env: &BTreeMap<String, String>, cwd: &Path) -> Result<EnvRegistry, String> {
     let path = env_registry_path(env, cwd)?;
-    if !path_exists(&path) {
-        return Ok(empty_env_registry());
-    }
-
-    let mut registry: EnvRegistry = read_json(&path)?;
+    let mut registry: EnvRegistry = if path_exists(&path) {
+        read_json(&path)?
+    } else {
+        empty_env_registry()
+    };
+    super::dev_ui_ports::hydrate(&mut registry.envs, env, cwd)?;
     registry.kind = "ocm-env-registry".to_string();
     registry
         .envs
@@ -94,24 +96,22 @@ fn write_env_registry(
     write_json(&path, &registry)
 }
 
-pub(crate) struct EnvRegistryLock {
-    file: File,
-}
+pub(crate) type EnvRegistryLock = super::common::ExclusiveFileLock;
+pub(crate) type EnvironmentOperationLock = super::common::ExclusiveFileLock;
 
-pub(crate) struct EnvironmentOperationLock {
-    file: File,
-}
-
-impl Drop for EnvRegistryLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
-
-impl Drop for EnvironmentOperationLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
+pub(super) fn environment_operation_lock_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    // Every env binding, service, snapshot, and guarded-destroy mutation shares
+    // this lock. Bypassing it can make an accepted destroy token stale.
+    let safe_name = validate_name(name, "Environment name")?;
+    Ok(resolve_store_paths(env, cwd)?
+        .home
+        .join("locks")
+        .join("environments")
+        .join(format!("{safe_name}.lock")))
 }
 
 pub(crate) fn lock_environment_operation(
@@ -119,34 +119,21 @@ pub(crate) fn lock_environment_operation(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvironmentOperationLock, String> {
-    // Every env binding, service, snapshot, and guarded-destroy mutation shares
-    // this lock. Bypassing it can make an accepted destroy token stale.
-    let safe_name = validate_name(name, "Environment name")?;
-    let lock_dir = resolve_store_paths(env, cwd)?
-        .home
-        .join("locks")
-        .join("environments");
-    ensure_dir(&lock_dir)?;
-    let lock_path = lock_dir.join(format!("{safe_name}.lock"));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            format!(
-                "failed to open environment operation lock {}: {error}",
-                display_path(&lock_path)
-            )
-        })?;
-    file.lock_exclusive().map_err(|error| {
-        format!(
-            "failed to lock environment operation {}: {error}",
-            display_path(&lock_path)
-        )
-    })?;
-    Ok(EnvironmentOperationLock { file })
+    super::lock_file(
+        &environment_operation_lock_path(name, env, cwd)?,
+        "environment operation",
+    )
+}
+
+pub(crate) fn try_lock_environment_operation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<EnvironmentOperationLock>, String> {
+    super::try_lock_file(
+        &environment_operation_lock_path(name, env, cwd)?,
+        "environment operation",
+    )
 }
 
 pub(crate) fn lock_env_registry(
@@ -156,30 +143,10 @@ pub(crate) fn lock_env_registry(
     // Keep load/allocate/write under one cross-process lock. Locking only the
     // final rename loses concurrent entries and can assign duplicate ports.
     let registry_path = env_registry_path(env, cwd)?;
-    let parent = registry_path
-        .parent()
-        .ok_or_else(|| "environment registry has no parent directory".to_string())?;
-    ensure_dir(parent)?;
-    let lock_path = registry_path.with_extension("lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            format!(
-                "failed to open environment registry lock {}: {error}",
-                display_path(&lock_path)
-            )
-        })?;
-    file.lock_exclusive().map_err(|error| {
-        format!(
-            "failed to lock environment registry {}: {error}",
-            display_path(&lock_path)
-        )
-    })?;
-    Ok(EnvRegistryLock { file })
+    super::lock_file(
+        &registry_path.with_extension("lock"),
+        "environment registry",
+    )
 }
 
 fn normalize_environment(mut meta: EnvMeta) -> Result<EnvMeta, String> {
@@ -202,11 +169,83 @@ fn canonicalize_launcher_binding(
     Ok(meta)
 }
 
-fn upsert_environment(registry: &mut EnvRegistry, meta: EnvMeta) -> Result<EnvMeta, String> {
+fn upsert_environment(
+    registry: &mut EnvRegistry,
+    meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(EnvMeta, Option<super::SharedFileLock>), String> {
+    let admission = admit_runtime_binding(
+        registry,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        runtime_guard,
+        env,
+        cwd,
+    )?;
     let meta = normalize_environment(meta)?;
+    if registry
+        .envs
+        .iter()
+        .find(|current| current.name == meta.name)
+        .is_none_or(|current| current.root != meta.root || current.dev != meta.dev)
+    {
+        // Creation may have initialized a new root at an absent Owned path.
+        // Its pre-creation guard already checked Owned sources.
+        super::dev_sources::ensure_borrowed_source_isolation(
+            &meta.name,
+            Path::new(&meta.root),
+            meta.dev.as_ref().and_then(|dev| dev.borrowed_source_root()),
+            &registry.envs,
+        )?;
+    }
     registry.envs.retain(|entry| entry.name != meta.name);
     registry.envs.push(meta.clone());
-    Ok(meta)
+    Ok((meta, admission))
+}
+
+fn admit_runtime_binding(
+    registry: &EnvRegistry,
+    name: &str,
+    runtime: Option<&str>,
+    held: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<super::SharedFileLock>, String> {
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    if registry
+        .envs
+        .iter()
+        .any(|current| current.name == name && current.default_runtime.as_deref() == Some(runtime))
+    {
+        return Ok(None);
+    }
+    if held.is_some_and(|guard| guard.check(runtime, env, cwd).is_ok()) {
+        return Ok(None);
+    }
+    // Never wait on a runtime while holding the registry: its owner needs the
+    // registry to publish its own binding or complete recovery.
+    super::try_lock_runtime_binding(runtime, env, cwd).map(Some)
+}
+
+pub(crate) fn lock_environment_runtime_binding(
+    meta: &EnvMeta,
+    held: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<Option<super::SharedFileLock>, String> {
+    let _registry = lock_env_registry(env, cwd)?;
+    admit_runtime_binding(
+        &load_env_registry(env, cwd)?,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        held,
+        env,
+        cwd,
+    )
 }
 
 fn find_environment(registry: &EnvRegistry, name: &str) -> Option<EnvMeta> {
@@ -220,6 +259,19 @@ fn bump_service_policy_revision(registry: &mut EnvRegistry, name: &str) -> u64 {
         .or_default();
     *revision = revision.saturating_add(1);
     *revision
+}
+
+pub(crate) fn environment_service_policy_revision(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<u64, String> {
+    let name = validate_name(name, "Environment name")?;
+    Ok(load_env_registry(env, cwd)?
+        .service_policy_revisions
+        .get(&name)
+        .copied()
+        .unwrap_or_default())
 }
 
 pub fn list_environments(
@@ -243,17 +295,52 @@ pub fn get_environment(
 }
 
 pub fn save_environment(
-    mut meta: EnvMeta,
+    meta: EnvMeta,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    save_environment_with_runtime_guard(meta, None, env, cwd)
+}
+
+pub(crate) fn save_environment_with_runtime_guard(
+    meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
+    save_environment_registered(meta, &registration, runtime_guard, env, cwd)
+}
+
+pub(crate) fn save_environment_with_dev_registration(
+    meta: EnvMeta,
+    registration: &DevSourceRegistration,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    save_environment_registered(meta, registration, None, env, cwd)
+}
+
+fn save_environment_registered(
+    meta: EnvMeta,
+    registration: &DevSourceRegistration,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&meta.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     let policy_changed = find_environment(&registry, &meta.name).is_some_and(|current| {
         current.service_enabled != meta.service_enabled
             || current.service_running != meta.service_running
     });
-    meta = upsert_environment(&mut registry, meta)?;
+    if policy_changed && meta.service_enabled && meta.service_running {
+        service.ensure_source_watch_allows_service(&meta.name)?;
+    }
+    let (meta, _admission) = upsert_environment(&mut registry, meta, runtime_guard, env, cwd)?;
     if policy_changed {
         bump_service_policy_revision(&mut registry, &meta.name);
     }
@@ -262,32 +349,78 @@ pub fn save_environment(
     Ok(meta)
 }
 
-pub(crate) fn save_environment_with_validated_launcher(
-    mut meta: EnvMeta,
+/// The caller retains the environment operation and Gateway admission locks.
+pub(crate) fn rebind_environment_dev(
+    expected: &EnvMeta,
+    dev: crate::env::EnvDevMeta,
+    registration: &DevSourceRegistration,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    let current = find_environment(&registry, &expected.name)
+        .filter(|current| current == expected)
+        .ok_or("environment changed during dev rebind; retry the command")?;
+    // Even a repeated target must still be the checkout inspected before admission.
+    registration.recheck_source(&dev, &registry.envs)?;
+    if current.dev.as_ref() == Some(&dev) {
+        return Ok(current);
+    }
+    let mut changed = current;
+    changed.dev = Some(dev);
+    let (changed, _admission) = upsert_environment(&mut registry, changed, None, env, cwd)?;
+    write_env_registry(&mut registry, env, cwd)?;
+    Ok(changed)
+}
+
+pub(crate) fn save_environment_with_validated_launcher(
+    mut meta: EnvMeta,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
+    let _lock = lock_env_registry(env, cwd)?;
+    let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
     meta = canonicalize_launcher_binding(meta, env, cwd)?;
-    meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
 
     Ok(meta)
 }
 
 pub(crate) fn save_environment_with_validated_runtime(
-    mut meta: EnvMeta,
+    meta: EnvMeta,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    save_environment_with_validated_runtime_guard(meta, None, env, cwd)
+}
+
+pub(crate) fn save_environment_with_validated_runtime_guard(
+    mut meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
+    registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
+    let _admitted = admit_runtime_binding(
+        &registry,
+        &meta.name,
+        meta.default_runtime.as_deref(),
+        runtime_guard,
+        env,
+        cwd,
+    )?;
     if let Some(runtime_name) = meta.default_runtime.as_deref() {
         meta.default_runtime =
             Some(super::runtimes::get_runtime_verified(runtime_name, env, cwd)?.name);
     }
-    meta = upsert_environment(&mut registry, meta)?;
+    let (meta, _admission) = upsert_environment(&mut registry, meta, runtime_guard, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
 
     Ok(meta)
@@ -301,6 +434,8 @@ pub(crate) fn set_environment_service_policy(
     cwd: &Path,
 ) -> Result<EnvironmentServicePolicyChange, String> {
     let safe_name = validate_name(name, "Environment name")?;
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&safe_name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let (applied, previous_service_enabled, previous_service_running) = {
@@ -316,6 +451,9 @@ pub(crate) fn set_environment_service_policy(
         }
         if let Some(service_running) = service_running {
             meta.service_running = service_running;
+        }
+        if meta.service_enabled && meta.service_running {
+            service.ensure_source_watch_allows_service(&safe_name)?;
         }
         meta.updated_at = now_utc();
         (
@@ -339,6 +477,8 @@ pub(crate) fn restore_environment_service_policy(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<bool, String> {
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&change.applied.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let current_revision = registry
@@ -370,6 +510,48 @@ pub fn create_environment(
     create_environment_with_runtime_validation(options, false, env, cwd)
 }
 
+fn ensure_root_outside_environments(
+    name: &str,
+    root: &Path,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    if envs.is_empty() {
+        return Ok(());
+    }
+    let resolve = |root: &Path| {
+        super::dev_registration::registration_path(root).map_err(|error| {
+            format!(
+                "failed to resolve environment root {}: {error}",
+                display_path(root)
+            )
+        })
+    };
+    let (target, mut target_entries) = resolve(root)?;
+    target_entries.insert(target.clone());
+    for current in envs {
+        let (registered, mut registered_entries) = resolve(Path::new(&current.root))?;
+        registered_entries.insert(registered.clone());
+        // Compare both the resolved roots and the links that keep them reachable.
+        // A disjoint target reached through a link inside another root is unsafe too.
+        for (container, entries) in [
+            (&registered, &target_entries),
+            (&target, &registered_entries),
+        ] {
+            for entry in entries {
+                if super::dev_sources::projected_path_contains(container, entry)? {
+                    return Err(format!(
+                        "environment {name} root {} overlaps environment {} root {}; choose a separate environment root",
+                        display_path(root),
+                        current.name,
+                        current.root
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn create_environment_with_validated_runtime(
     options: CreateEnvironmentOptions,
     env: &BTreeMap<String, String>,
@@ -385,11 +567,26 @@ fn create_environment_with_runtime_validation(
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
     let name = validate_name(&options.name, "Environment name")?;
+    let registration = DevSourceRegistration::acquire(&name, options.dev.as_ref(), env, cwd)?;
+    let service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission_lock = service.lock_gateway_admission(&name)?;
+    if options.service_enabled && options.service_running {
+        service.ensure_source_watch_allows_service(&name)?;
+    }
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     if find_environment(&registry, &name).is_some() {
         return Err(format!("environment \"{name}\" already exists"));
     }
+    registration.recheck(&name, options.dev.as_ref(), &registry.envs)?;
+    let _runtime_admission = admit_runtime_binding(
+        &registry,
+        &name,
+        options.default_runtime.as_deref(),
+        None,
+        env,
+        cwd,
+    )?;
     let default_runtime = if validate_runtime {
         options
             .default_runtime
@@ -413,6 +610,20 @@ fn create_environment_with_runtime_validation(
         default_env_root(&name, env, cwd)?
     };
 
+    ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    if let Some(source) = options
+        .dev
+        .as_ref()
+        .and_then(|dev| dev.borrowed_source_root())
+    {
+        super::dev_sources::ensure_root_outside_borrowed_source(
+            &name,
+            &root,
+            &name,
+            Path::new(source),
+        )?;
+    }
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -438,6 +649,7 @@ fn create_environment_with_runtime_validation(
     });
     let created_at = now_utc();
     let meta = EnvMeta {
+        upgrade_independent_paths: Vec::new(),
         kind: "ocm-env".to_string(),
         name,
         root: display_path(&paths.root),
@@ -448,12 +660,25 @@ fn create_environment_with_runtime_validation(
         default_runtime,
         default_launcher,
         dev: options.dev,
+        dev_ui_port: None,
         protected: options.protected,
         created_at,
         updated_at: created_at,
         last_used_at: None,
     };
-    let meta = upsert_environment(&mut registry, meta)?;
+    if meta.dev.is_some()
+        && !super::openclaw_config::initialize_new_dev_openclaw_config(
+            &paths,
+            gateway_port.expect("new environments have a selected Gateway port"),
+        )?
+    {
+        return Err(format!(
+            "OpenClaw config appeared while creating dev env {}; preserving it without registering the env: {}",
+            meta.name,
+            display_path(&paths.config_path)
+        ));
+    }
+    let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
     Ok(meta)
 }
@@ -519,11 +744,21 @@ fn clone_environment_with_policy(
         return Err(format!("environment \"{name}\" already exists"));
     }
 
+    let _runtime_admission = admit_runtime_binding(
+        &registry,
+        &name,
+        source.default_runtime.as_deref(),
+        None,
+        env,
+        cwd,
+    )?;
     let root = if let Some(root) = options.root.as_deref() {
         resolve_absolute_path(root, env, cwd)?
     } else {
         default_env_root(&name, env, cwd)?
     };
+    ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
         let mut entries = fs::read_dir(&target_paths.root).map_err(|error| error.to_string())?;
@@ -542,6 +777,7 @@ fn clone_environment_with_policy(
             display_path(&source_paths.root)
         ));
     }
+    validate_nonportable_runtime_state_paths(&source_paths)?;
     if matches!(policy, CloneEnvironmentPolicy::Standard) {
         reject_include_owned_sandbox_origin(&source_paths.config_path)?;
         reject_include_owned_agent_workspaces(&source_paths.config_path)?;
@@ -554,6 +790,7 @@ fn clone_environment_with_policy(
     source_workspaces.archive_relative_roots(&source_paths.root)?;
     let result = (|| {
         copy_dir_recursive(&source_paths.root, &target_paths.root)?;
+        validate_nonportable_runtime_state_paths(&target_paths)?;
         let created_at = now_utc();
         let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env);
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
@@ -635,7 +872,11 @@ fn clone_environment_with_policy(
             }
         };
 
+        super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+        super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
+
         let meta = EnvMeta {
+            upgrade_independent_paths: Vec::new(),
             kind: "ocm-env".to_string(),
             name,
             root: display_path(&target_paths.root),
@@ -646,12 +887,13 @@ fn clone_environment_with_policy(
             default_runtime: source.default_runtime,
             default_launcher: source.default_launcher,
             dev: None,
+            dev_ui_port: None,
             protected: source.protected,
             created_at,
             updated_at: created_at,
             last_used_at: None,
         };
-        let meta = upsert_environment(&mut registry, meta)?;
+        let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
         write_env_registry(&mut registry, env, cwd)?;
         Ok(CloneEnvironmentResult {
             meta,
@@ -894,11 +1136,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err(format!("environment \"{name}\" already exists"));
         }
 
+        let _runtime_admission = admit_runtime_binding(
+            &registry,
+            &name,
+            extracted.metadata.env.default_runtime.as_deref(),
+            None,
+            env,
+            cwd,
+        )?;
         let root = if let Some(root) = options.root.as_deref() {
             resolve_absolute_path(root, env, cwd)?
         } else {
             default_env_root(&name, env, cwd)?
         };
+        ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+        ensure_root_outside_environments(&name, &root, &registry.envs)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {
             let mut entries =
@@ -915,6 +1167,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err("archive is missing root/".to_string());
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
+        validate_nonportable_runtime_state_paths(&extracted_paths)?;
         reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
         reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
         let extracted_workspaces = resolve_env_openclaw_workspaces(
@@ -932,6 +1185,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
             copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+            validate_nonportable_runtime_state_paths(&target_paths)?;
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
             let config_rewrite = rewrite_openclaw_config_for_new_environment(
                 &target_paths,
@@ -956,6 +1210,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
 
             let created_at = now_utc();
             let meta = EnvMeta {
+                upgrade_independent_paths: Vec::new(),
                 kind: "ocm-env".to_string(),
                 name: name.clone(),
                 root: display_path(&target_paths.root),
@@ -966,12 +1221,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 default_runtime: extracted.metadata.env.default_runtime.clone(),
                 default_launcher: extracted.metadata.env.default_launcher.clone(),
                 dev: None,
+                dev_ui_port: None,
                 protected: extracted.metadata.env.protected,
                 created_at,
                 updated_at: created_at,
                 last_used_at: None,
             };
-            let meta = upsert_environment(&mut registry, meta)?;
+            let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
             write_env_registry(&mut registry, env, cwd)?;
             Ok((meta, config_rewrite))
         })();
@@ -1007,7 +1263,21 @@ pub fn remove_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    let _operation = lock_environment_operation(name, env, cwd)?;
+    remove_environment_locked(name, force, env, cwd, |_| Ok(()))
+}
+
+pub(crate) fn remove_environment_locked(
+    name: &str,
+    force: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    before_remove: impl FnOnce(&EnvMeta) -> Result<(), String>,
+) -> Result<EnvMeta, String> {
     let safe_name = validate_name(name, "Environment name")?;
+    let source_service = crate::env::EnvironmentService::new(env, cwd);
+    let _admission = source_service.lock_gateway_admission(&safe_name)?;
+    source_service.ensure_source_watch_stopped(&safe_name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let meta = find_environment(&registry, &safe_name)
@@ -1021,19 +1291,27 @@ pub fn remove_environment(
 
     let paths = derive_env_paths(Path::new(&meta.root));
 
-    if let Some(dev) = meta.dev.as_ref() {
-        remove_openclaw_worktree(Path::new(&dev.repo_root), Path::new(&dev.worktree_root))?;
+    super::dev_sources::ensure_environment_removal_preserves_dev_sources(&meta, &registry.envs)?;
+    // Preliminary cleanup shares this registry lock through final deletion.
+    // It must not call back into registry-mutating operations.
+    before_remove(&meta)?;
+
+    if let Some((repo_root, worktree_root)) = meta.dev.as_ref().and_then(|dev| dev.owned_worktree())
+    {
+        remove_openclaw_worktree(Path::new(repo_root), Path::new(worktree_root))?;
     }
 
     if path_exists(&paths.root) {
         fs::remove_dir_all(&paths.root).map_err(|error| error.to_string())?;
     }
 
+    source_service.remove_stopped_source_watch_state_locked(&safe_name)?;
     registry.envs.retain(|entry| entry.name != meta.name);
     // Keep a monotonic tombstone so a stale rollback token cannot target a
     // later environment that reuses the same name.
     bump_service_policy_revision(&mut registry, &meta.name);
     write_env_registry(&mut registry, env, cwd)?;
+    super::dev_ui_ports::remove(&meta, env, cwd)?;
 
     Ok(meta)
 }
@@ -1061,7 +1339,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use crate::env::CreateEnvironmentOptions;
+    use crate::env::{CreateEnvironmentOptions, EnvDevMeta};
     use serde_json::{Value, json};
 
     use super::{
@@ -1071,6 +1349,59 @@ mod tests {
         get_environment, remove_environment, restore_environment_service_policy, save_environment,
         set_environment_service_policy,
     };
+
+    #[test]
+    fn private_config_dev_is_published_with_new_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            (
+                "HOME".to_string(),
+                root.path().join("home").display().to_string(),
+            ),
+            (
+                "OCM_HOME".to_string(),
+                root.path().join("ocm-home").display().to_string(),
+            ),
+        ]);
+        for (name, dev) in [
+            (
+                "dev",
+                Some(EnvDevMeta::Owned {
+                    repo_root: root.path().join("repo").display().to_string(),
+                    worktree_root: root.path().join("worktree").display().to_string(),
+                }),
+            ),
+            ("ordinary", None),
+        ] {
+            let meta = create_environment(
+                CreateEnvironmentOptions {
+                    name: name.to_string(),
+                    root: None,
+                    gateway_port: Some(if dev.is_some() { 19789 } else { 19821 }),
+                    service_enabled: false,
+                    service_running: false,
+                    default_runtime: None,
+                    default_launcher: None,
+                    dev,
+                    protected: false,
+                },
+                &env,
+                root.path(),
+            )
+            .unwrap();
+            let published = get_environment(name, &env, root.path()).unwrap();
+            assert_eq!(published.root, meta.root);
+            let paths = derive_env_paths(Path::new(&meta.root));
+            assert_eq!(paths.config_path.is_file(), meta.dev.is_some());
+            if meta.dev.is_some() {
+                let config: Value =
+                    serde_json::from_slice(&fs::read(&paths.config_path).unwrap()).unwrap();
+                let token = config["gateway"]["auth"]["token"].as_str().unwrap();
+                assert_eq!(token.len(), 64);
+                assert!(!serde_json::to_string(&published).unwrap().contains(token));
+            }
+        }
+    }
 
     #[test]
     fn service_policy_rollback_requires_the_applied_snapshot_to_still_be_current() {
@@ -1231,6 +1562,54 @@ mod tests {
         fs::write(source_paths.state_dir.join("logs/gateway.log"), "source\n").unwrap();
         fs::write(source_paths.state_dir.join("openclaw.json.bak"), "{}\n").unwrap();
 
+        let local_plugin = source_paths.root.join("local-plugin");
+        fs::create_dir_all(&local_plugin).unwrap();
+        fs::write(local_plugin.join("index.js"), "export default {};\n").unwrap();
+        let external_project = root.join("plugin-project");
+        fs::create_dir_all(&external_project).unwrap();
+        let database = source_paths.state_dir.join("state/openclaw.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute(
+            "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO config_machine_state (state_key, value_json) VALUES ('plugins.installedIndex', ?1)",
+            [json!({"revision": 42, "index": {"installRecords": {
+                "local": {"source": "path", "sourcePath": external_project,
+                    "installPath": local_plugin},
+                "missing": {"source": "npm", "spec": "absent-plugin@1.0.0",
+                    "installPath": source_paths.state_dir.join("extensions/absent")}
+            }}}).to_string()],
+        ).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL);
+             INSERT INTO agent_database_leases VALUES ('copied-source-owner', 1);",
+        ).unwrap();
+        drop(connection);
+        let source_database_before = fs::read(&database).unwrap();
+
+        let registry = super::env_registry_path(&env, &cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let nested = source_paths.root.join("nested-simulation");
+        let rejected = clone_environment_for_simulation(
+            CloneEnvironmentOptions {
+                source_name: "source".to_string(),
+                name: "blocked-simulation".to_string(),
+                root: Some(nested.display().to_string()),
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(
+            rejected.contains("overlaps environment source root"),
+            "{rejected}"
+        );
+        assert!(!nested.exists());
+        assert_eq!(fs::read(&registry).unwrap(), registry_before);
+
         let simulation = clone_environment_for_simulation(
             CloneEnvironmentOptions {
                 source_name: "source".to_string(),
@@ -1243,6 +1622,51 @@ mod tests {
         .unwrap();
 
         let target_paths = derive_env_paths(Path::new(&simulation.root));
+        let connection =
+            rusqlite::Connection::open(target_paths.state_dir.join("state/openclaw.sqlite"))
+                .unwrap();
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
+        let document: String = connection.query_row(
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        drop(connection);
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["revision"], 42);
+        let records = &document["index"]["installRecords"];
+        assert_eq!(
+            records["local"]["sourcePath"],
+            external_project.display().to_string()
+        );
+        assert_eq!(
+            records["local"]["installPath"],
+            target_paths.root.join("local-plugin").display().to_string()
+        );
+        assert_eq!(
+            records["missing"]["installPath"],
+            target_paths
+                .state_dir
+                .join("extensions/absent")
+                .display()
+                .to_string()
+        );
+        assert!(!target_paths.state_dir.join("extensions/absent").exists());
+        fs::write(
+            target_paths.root.join("local-plugin/index.js"),
+            "clone-only\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(local_plugin.join("index.js")).unwrap(),
+            "export default {};\n"
+        );
+        assert_eq!(fs::read(&database).unwrap(), source_database_before);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&target_paths.config_path).unwrap()).unwrap();
         let gateway_port = simulation.gateway_port.unwrap();

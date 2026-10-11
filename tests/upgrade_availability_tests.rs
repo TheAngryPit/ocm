@@ -248,6 +248,7 @@ fn write_running_supervisor_runtime(
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: vec![SupervisorRuntimeService {
             env_name: "demo".to_string(),
@@ -266,6 +267,7 @@ fn write_running_supervisor_runtime(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "runtime".to_string(),
             binding_name: binding_name.to_string(),
@@ -284,6 +286,7 @@ fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: None,
         updated_at: now_utc(),
         services: Vec::new(),
         children: Vec::new(),
@@ -572,9 +575,17 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         finalize_timeline.mark("publication_released");
     });
 
+    #[cfg(target_os = "macos")]
+    let log_relative = ".openclaw-rosita-node/logs/node.error.log";
+    #[cfg(target_os = "macos")]
+    let log_writer = support::active_service_log::ActiveServiceLog::start(
+        &Path::new(env_json["root"].as_str().unwrap()).join(log_relative),
+    );
     timeline.mark("command_started");
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo"]);
     timeline.mark("command_finished");
+    #[cfg(target_os = "macos")]
+    let final_log = log_writer.finish();
 
     finalize_releaser.join().unwrap();
     delayed_server.join().unwrap();
@@ -644,6 +655,22 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
     let history_json: Value = serde_json::from_slice(&history.stdout).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let snapshot_id = history_json[0]["snapshotId"].as_str().unwrap();
+        let snapshot = run_ocm(
+            &cwd,
+            &env,
+            &["env", "snapshot", "show", "demo", snapshot_id, "--json"],
+        );
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let snapshot_json: Value = serde_json::from_slice(&snapshot.stdout).unwrap();
+        let captured =
+            fs::read(Path::new(snapshot_json["archivePath"].as_str().unwrap()).join(log_relative))
+                .unwrap();
+        assert!(!captured.is_empty());
+        assert!(final_log.starts_with(&captured));
+    }
     let phases = history_json[0]["phases"]
         .as_array()
         .expect("upgrade receipt must include structured phase timings");

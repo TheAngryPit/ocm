@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[cfg(target_os = "macos")]
+pub mod active_service_log;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -64,6 +67,82 @@ impl Drop for TestDir {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+pub fn register_owned_dev_env(
+    repo: &Path,
+    worktree: &Path,
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> ocm::env::EnvMeta {
+    register_owned_dev_env_with_root(repo, worktree, name, None, env, cwd)
+}
+
+fn register_owned_dev_env_with_root(
+    repo: &Path,
+    worktree: &Path,
+    name: &str,
+    root: Option<&Path>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> ocm::env::EnvMeta {
+    ocm::env::EnvironmentService::new(env, cwd)
+        .create(ocm::env::CreateEnvironmentOptions {
+            name: name.to_string(),
+            root: root.map(path_string),
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: Some(ocm::env::EnvDevMeta::Owned {
+                repo_root: path_string(&fs::canonicalize(repo).unwrap()),
+                worktree_root: path_string(worktree),
+            }),
+            protected: false,
+        })
+        .unwrap()
+}
+
+pub fn create_owned_dev_env(
+    repo: &Path,
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    create_owned_dev_env_with_root(repo, name, None, env, cwd)
+}
+
+pub fn create_owned_dev_env_at_root(
+    repo: &Path,
+    name: &str,
+    root: &Path,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    create_owned_dev_env_with_root(repo, name, Some(root), env, cwd)
+}
+
+fn create_owned_dev_env_with_root(
+    repo: &Path,
+    name: &str,
+    root: Option<&Path>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> PathBuf {
+    let relative = Path::new(".worktrees").join(name);
+    let created = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&relative)
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{}", stderr(&created));
+    let worktree = fs::canonicalize(repo).unwrap().join(relative);
+    register_owned_dev_env_with_root(repo, &worktree, name, root, env, cwd);
+    worktree
 }
 
 impl TestHttpServer {
@@ -221,7 +300,27 @@ pub fn base_env(home: &Path) -> BTreeMap<String, String> {
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_string(), path);
     }
+    #[cfg(windows)]
+    {
+        // Windows system DLLs still need SystemRoot in an isolated environment.
+        let system_root = std::env::var("SystemRoot").expect("Windows fixture requires SystemRoot");
+        env.insert("SystemRoot".to_string(), system_root);
+    }
     env
+}
+
+pub fn hold_environment_operation(root: &TestDir, name: &str) -> fs::File {
+    let path = root.child(format!("ocm-home/locks/environments/{name}.lock"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    lock
 }
 
 pub fn ocm_env(root: &TestDir) -> BTreeMap<String, String> {
@@ -295,14 +394,38 @@ pub fn write_executable_script(path: &Path, contents: &str) {
     }
 }
 
+#[cfg(unix)]
+pub fn npm_fixture(package: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (platform, target) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "aarch64-apple-darwin"),
+        ("macos", "x86_64") => ("darwin-x64", "x86_64-apple-darwin"),
+        ("linux", "x86_64") if cfg!(target_env = "gnu") => {
+            ("linux-x64", "x86_64-unknown-linux-gnu")
+        }
+        _ => return None,
+    };
+    let payload = package.join(format!("node_modules/@openclaw/ocm-{platform}"));
+    write_text(
+        &payload.join("package.json"),
+        r#"{"name":"@openclaw/ocm","version":"9.0.0"}"#,
+    );
+    let binary = payload.join(format!("vendor/{target}/bin/ocm"));
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
+    let entrypoint = package.join("bin/ocm.cjs");
+    write_executable_script(&entrypoint, include_str!("../../npm/ocm.cjs"));
+    Some((entrypoint, binary))
+}
+
 pub fn install_fake_launchctl(root: &TestDir, env: &mut BTreeMap<String, String>) {
     let bin_dir = root.child("fake-bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let log_path = root.child("launchctl.log");
     let print_path = root.child("launchctl-print.txt");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    printf 'state = running\\npid = 23613\\n' > \"{}\"\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"$2\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1\" in\n  bootstrap)\n    if [ -n \"$OCM_TEST_NATIVE_DAEMON_PID\" ]; then\n      printf 'state = running\\npid = %s\\npath = %s\\n' \"$OCM_TEST_NATIVE_DAEMON_PID\" \"$3\" > \"{}\"\n    else\n      printf 'state = running\\npid = 23613\\n' > \"{}\"\n    fi\n    exit 0\n    ;;\n  bootout|unload)\n    /bin/rm -f \"{}\"\n    exit 0\n    ;;\n  print)\n    if [ -f \"{}\" ]; then\n      /bin/cat \"{}\"\n      exit 0\n    fi\n    printf 'Could not find service \"%s\" in domain for user gui\\n' \"${{2##*/}}\" >&2\n    exit 1\n    ;;\n  *)\n    exit 0\n    ;;\nesac\n",
         path_string(&log_path),
+        path_string(&print_path),
         path_string(&print_path),
         path_string(&print_path),
         path_string(&print_path),
@@ -329,7 +452,7 @@ pub fn install_fake_systemd_tools(root: &TestDir, env: &mut BTreeMap<String, Str
     let log_path = root.child("systemctl.log");
     let journal_log_path = root.child("journalctl.log");
     let systemctl_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=4242\\nFragmentPath=%s\\n' \"$unit_path\"\n    exit 0\n  fi\n  printf 'Unit %s could not be found\\n' \"$unit\" >&2\n  exit 1\nfi\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n  unit=\"$3\"\n  fixture_home=\"${{HOME:-$PWD}}\"\n  unit_path=\"$fixture_home/.config/systemd/user/$unit.service\"\n  if [ -f \"$unit_path\" ]; then\n    printf 'LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nSubState=running\\nMainPID=%s\\nFragmentPath=%s\\n' \"${{OCM_TEST_NATIVE_DAEMON_PID:-4242}}\" \"$unit_path\"\n    exit 0\n  fi\n  printf 'LoadState=not-found\\nUnitFileState=not-found\\nActiveState=inactive\\nSubState=dead\\nMainPID=0\\nFragmentPath=\\n'\n  exit 4\nfi\nexit 0\n",
         path_string(&log_path)
     );
     let journalctl_script = format!(
@@ -370,6 +493,99 @@ pub fn install_fake_service_manager(root: &TestDir, env: &mut BTreeMap<String, S
     } else {
         install_fake_systemd_tools(root, env);
     }
+}
+
+/// Opt into a simulated compatible daemon while retaining the fake manager's
+/// Gateway behavior. Its identity is bound to this test process's real lifetime;
+/// the separate native daemon tests verify actual capability publication.
+pub fn enable_fake_daemon_gateway_admission(
+    root: &TestDir,
+    env: &mut BTreeMap<String, String>,
+) -> ocm::supervisor::SupervisorGatewayAdmission {
+    let (started_at, process_scope) = fixture_process_ownership();
+    let capability =
+        serde_json::from_value::<ocm::supervisor::SupervisorGatewayAdmission>(serde_json::json!({
+            "version": 11,
+            "process": { "pid": std::process::id(), "startedAt": started_at },
+            "processScope": process_scope,
+        }))
+        .unwrap();
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".to_string(),
+        std::process::id().to_string(),
+    );
+    let runtime = ocm::supervisor::SupervisorRuntimeState {
+        kind: "ocm-supervisor-runtime".to_string(),
+        ocm_home: env.get("OCM_HOME").unwrap().clone(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: Some(capability.clone()),
+        updated_at: ocm::store::now_utc(),
+        services: Vec::new(),
+        children: Vec::new(),
+    };
+    write_json_replacing_path(
+        &ocm::store::supervisor_runtime_path(env, root.path()).unwrap(),
+        &runtime,
+    );
+    capability
+}
+
+fn fixture_process_ownership() -> (String, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let (_, fields) = stat.rsplit_once(')').unwrap();
+        let started_at = fields.split_whitespace().nth(19).unwrap().to_string();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let namespace = fs::read_link("/proc/self/ns/pid").unwrap();
+        return (
+            started_at,
+            Some(format!("{}:{}", boot.trim(), namespace.display())),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let size = std::mem::size_of_val(&info) as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as i32,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        assert_eq!(read, size, "failed reading the fixture process identity");
+        assert_eq!(info.pbi_pid, std::process::id());
+        return (
+            format!("{}:{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+            None,
+        );
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let read = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        assert_ne!(read, 0, "failed reading the fixture process identity");
+        let started = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        return (started.to_string(), None);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    panic!("native daemon fixture identity is unavailable on this platform");
 }
 
 pub fn install_fake_git_package_manager(
@@ -444,6 +660,9 @@ printf 'fake node run %s %s\n' "$script" "$*"
 if [ "$1" = "--version" ]; then
   printf '10.0.0\n'
   exit 0
+fi
+if [ -n "${OCM_TEST_NPM_LIFECYCLE_PROBE:-}" ]; then
+  "$OCM_TEST_NPM_LIFECYCLE_PROBE"
 fi
 
 prefix=""
@@ -561,6 +780,9 @@ case "$script" in
         echo "managed npm lifecycle PATH resolved node to ${{resolved_node:-missing}}, expected $0" >&2
         exit 1
       fi
+    fi
+    if [ -n "${{OCM_TEST_NPM_LIFECYCLE_PROBE:-}}" ]; then
+      "$OCM_TEST_NPM_LIFECYCLE_PROBE"
     fi
     prefix=""
     archive=""
@@ -734,6 +956,41 @@ pub fn ocm_test_binary_path() -> PathBuf {
     std::env::var_os("OCM_TEST_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ocm")))
+}
+
+// Use these only when a fixture needs a fixed foreground mode. Default-mode,
+// service, help, and flag-validation cases should keep their raw CLI arguments.
+pub fn dev_plain<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    dev_mode_args(args, false)
+}
+
+pub fn dev_watch<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    dev_mode_args(args, true)
+}
+
+fn dev_mode_args<'a>(args: &[&'a str], watch: bool) -> Vec<&'a str> {
+    assert!(
+        args.first()
+            .is_some_and(|name| !name.starts_with('-') && !matches!(*name, "status" | "stop")),
+        "a fixed dev mode requires an environment name"
+    );
+    assert!(
+        !args.contains(&"--service"),
+        "service arguments must stay explicit"
+    );
+    assert_eq!(
+        args.contains(&"--watch"),
+        watch,
+        "dev fixture mode does not match its arguments"
+    );
+    let mut fixed: Vec<_> = std::iter::once("dev").chain(args.iter().copied()).collect();
+    if !watch {
+        fixed.push("--no-watch");
+    }
+    if !args.contains(&"--ui") {
+        fixed.push("--no-ui");
+    }
+    fixed
 }
 
 pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Output {

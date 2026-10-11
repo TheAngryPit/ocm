@@ -34,6 +34,8 @@ impl Cli {
         match action {
             "identity" => self.handle_daemon_identity(rest),
             "run" => self.handle_daemon_run(rest),
+            "self-update" => self.run_self_update_worker(rest),
+            "upgrade-job" => self.run_upgrade_job(rest),
             _ => Err(format!("unknown internal command: {action}")),
         }
     }

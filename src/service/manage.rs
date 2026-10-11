@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -180,6 +180,7 @@ pub fn restart_service(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
+    EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(name)?;
     ensure_gateway_binding(name, env, cwd)?;
     let env_service = EnvironmentService::new(env, cwd);
     let meta = env_service.get(name)?;
@@ -212,7 +213,7 @@ pub fn restart_service(
         );
     }
 
-    spawn_recovery_aware_restart(name, env, cwd)?;
+    let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
 
     if restart_originates_inside_gateway(name, env) {
         let mut warnings = vec![
@@ -227,11 +228,18 @@ pub fn restart_service(
         return Ok(service_action_summary("restart", summary, warnings));
     }
 
-    let status = wait_for_restart_action_summary(name, before.child_pid, env, cwd)?;
+    let status = wait_for_restart_action_summary_with_timeout(
+        name,
+        before.child_pid,
+        Duration::from_secs(30),
+        env,
+        cwd,
+        Some(&mut helper),
+    )?;
     let mut warnings = status.warnings;
     if !status.observed_restart {
         warnings.push(
-            "recovery-aware restart was accepted, but OCM did not observe a replacement gateway within 30 seconds; no direct supervisor restart was attempted"
+            "recovery-aware restart was requested, but OCM did not observe a replacement gateway within 30 seconds; no direct supervisor restart was attempted"
                 .to_string(),
         );
     }
@@ -265,6 +273,7 @@ fn restart_running_service_directly(
                     Duration::from_secs(5),
                     env,
                     cwd,
+                    None,
                 )?;
                 if !status.observed_restart {
                     return Err(
@@ -296,7 +305,7 @@ fn spawn_recovery_aware_restart(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<(), String> {
+) -> Result<Child, String> {
     let args = vec![
         "gateway".to_string(),
         "restart".to_string(),
@@ -322,23 +331,26 @@ fn spawn_recovery_aware_restart(
 
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => {
-                return Err(format!(
-                    "OpenClaw rejected the recovery-aware restart for env \"{name}\" (exit code {}); no direct supervisor restart was attempted. Inspect the gateway logs or use \"ocm service restart {name} --force\" to bypass OpenClaw recovery handoff",
-                    status.code().unwrap_or(1)
-                ));
-            }
-            Ok(None) => sleep(Duration::from_millis(25)),
-            Err(error) => {
-                return Err(format!(
-                    "failed to inspect the recovery-aware restart helper for env \"{name}\": {error}"
-                ));
-            }
+        if recovery_aware_restart_finished(name, &mut child)? {
+            break;
         }
+        sleep(Duration::from_millis(25));
     }
-    Ok(())
+    Ok(child)
+}
+
+fn recovery_aware_restart_finished(name: &str, child: &mut Child) -> Result<bool, String> {
+    match child.try_wait() {
+        Ok(Some(status)) if status.success() => Ok(true),
+        Ok(Some(status)) => Err(format!(
+            "OpenClaw rejected the recovery-aware restart for env \"{name}\" (exit code {}); no direct supervisor restart was attempted. Inspect the gateway logs or use \"ocm service restart {name} --force\" to bypass OpenClaw recovery handoff",
+            status.code().unwrap_or(1)
+        )),
+        Ok(None) => Ok(false),
+        Err(error) => Err(format!(
+            "failed to inspect the recovery-aware restart helper for env \"{name}\": {error}"
+        )),
+    }
 }
 
 struct ResolvedRestartCommand {
@@ -455,6 +467,9 @@ fn update_service(
 ) -> Result<ServiceActionSummary, String> {
     let (action, service_enabled, service_running, require_binding, supervisor_policy) =
         update.settings();
+    if service_running == Some(true) || matches!(update, ServiceUpdate::Install) {
+        EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(name)?;
+    }
     if require_binding {
         ensure_gateway_binding(name, env, cwd)?;
     }
@@ -464,6 +479,10 @@ fn update_service(
     let _lifecycle_lock = supervisor.lock_daemon_lifecycle()?;
     supervisor.validate_daemon_owner_locked()?;
     let daemon_before = supervisor.daemon_status()?;
+    if matches!(supervisor_policy, ServiceSupervisorPolicy::EnsureRunning) && !daemon_before.running
+    {
+        supervisor.require_durable_daemon_executable()?;
+    }
     let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
     let update_result = match supervisor_policy {
         ServiceSupervisorPolicy::EnsureRunning => sync_supervisor_env_if_present(env, cwd, name)
@@ -596,6 +615,7 @@ fn wait_for_restart_action_summary(
         Duration::from_secs(30),
         env,
         cwd,
+        None,
     )
 }
 
@@ -605,37 +625,46 @@ fn wait_for_restart_action_summary_with_timeout(
     timeout: Duration,
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    mut helper: Option<&mut Child>,
 ) -> Result<RestartActionStatus, String> {
     let deadline = Instant::now() + timeout;
-    let mut latest = super::inspect::service_status_fast(name, env, cwd)?;
-    while Instant::now() < deadline {
-        if latest.running
+    loop {
+        let latest = super::inspect::service_status_fast(name, env, cwd)?;
+        // A replacement can appear before the helper reports its outcome.
+        // Collect that outcome before readiness can turn a rejection into success.
+        let helper_finished = match helper.as_deref_mut() {
+            Some(child) => recovery_aware_restart_finished(name, child)?,
+            None => true,
+        };
+        let observed_restart = latest.running
             && latest
                 .child_pid
-                .is_some_and(|child_pid| previous_pid != Some(child_pid))
-        {
+                .is_some_and(|child_pid| previous_pid != Some(child_pid));
+        if (observed_restart && helper_finished) || Instant::now() >= deadline {
+            let mut warnings = Vec::new();
+            if !observed_restart {
+                warnings.push(match previous_pid {
+                    Some(previous_pid) => format!(
+                        "gateway restart is still in progress; previous child pid was {previous_pid}"
+                    ),
+                    None => "gateway restart is still in progress; no replacement child pid has been observed"
+                        .to_string(),
+                });
+            }
+            if !helper_finished {
+                warnings.push(
+                    "OpenClaw restart helper is still running; its result has not been confirmed"
+                        .to_string(),
+                );
+            }
             return Ok(RestartActionStatus {
                 summary: latest,
-                warnings: Vec::new(),
-                observed_restart: true,
+                warnings,
+                observed_restart,
             });
         }
         sleep(Duration::from_millis(100));
-        latest = super::inspect::service_status_fast(name, env, cwd)?;
     }
-
-    let warning = match previous_pid {
-        Some(previous_pid) => {
-            format!("gateway restart is still in progress; previous child pid was {previous_pid}")
-        }
-        None => "gateway restart is still in progress; no replacement child pid has been observed"
-            .to_string(),
-    };
-    Ok(RestartActionStatus {
-        summary: latest,
-        warnings: vec![warning],
-        observed_restart: false,
-    })
 }
 
 fn service_action_summary(

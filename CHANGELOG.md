@@ -18,16 +18,48 @@ All notable changes to OCM are documented here.
 
 ### Added
 
+- Add Unix `env artifact export` for bounded, raw file reads beneath an environment
+  home, rejecting unsafe paths and observed file changes without choosing the
+  caller's destination.
+- Make `ocm self update` a recoverable local transaction that retains the previous executable, survives caller disconnection, refreshes a running daemon, checks gateway recovery, and records a durable result. Add `--status` and `--recover` for interrupted updates.
+- Prepare `@openclaw/ocm` npm distribution of signed Rust binaries, with a
+  no-download launcher, exact platform aliases, and manual OIDC publishing.
+  Include every npm CI lane in automatic-release verification.
 - Let `runtime build-local` assemble repeatable, commit-matched official companion plugins through OpenClaw's release packaging contract, stage them as trusted runtime-owned bundled plugins with isolated dependencies, and record artifact and entrypoint hashes for verification.
 
 ### Changed
 
+- Refresh seven compatible Rust dependencies, including cc 1.7.0 and smallvec 1.16.3, while retaining Rust 1.88 support.
+- Update `libc` to 0.2.190 and the pinned Rust installer action to retry transient official-server checksum failures, retaining Rust 1.88 support.
+- Update `cc` to 1.5.1, `find-msvc-tools` to 0.1.14, and `smallvec` to 1.16.2 while retaining Rust 1.88 support.
+- Define ordered remote development checks, isolated checkout transfer, and proof reuse in the contributor guide. Thanks @shakkernerd (#290).
+- Update fresh managed Node.js installs and CI to 24.21.0 while preserving cached 24.15.0 toolchains across OCM upgrades.
+- Document live npm and Homebrew availability in v0.2.40, observed one-time
+  bootstrap recovery, and the manual ARM payload's provenance exception.
+- Keep package-manager distribution on npm and Homebrew only; disable Cargo
+  publication while retaining source installation and the internal `ocm` name.
 - Refresh Rust dependencies and pinned CI actions while preserving Rust 1.88 support.
 - Make `ocm service restart <env>` restart immediately through OpenClaw's protocol-v1 recovery handoff so eligible interrupted sessions and subagents resume after startup, preserve the legacy direct-restart behavior with a warning when recovery is unavailable, keep `--force` as an explicit bypass for an unhealthy handoff, and avoid self-restart deadlocks.
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.
 
 ### Fixed
 
+- Disclose skipped candidate preparation and validation in upgrade dry-run text and JSON, including batch previews, and point operators to isolated simulation. Thanks @shakkernerd (#124).
+- Limit runtime metadata to 64 MiB of decoded JSON, including gzip expansion, and preserve installed runtime files and metadata when an oversized update source is rejected. Thanks @SebTardif (#117).
+- Preserve newer Stop and Uninstall requests after foreground development sessions, and refuse foreground startup while a superseding request leaves the background Gateway running or requested. Thanks @shakkernerd (#299, #310).
+- Keep runtime binding admission isolated through upgrade finalization and rollback so a newly attached sibling cannot receive another environment's uncheckpointed downgrade. Thanks @shakkernerd (#296, #309).
+- Preserve Unix shell `exec` semantics for unquoted managed-service launcher recipes. Thanks @shakkernerd (#300, #308).
+- Report delayed native restart rejection as a failed service action even while the original Gateway remains healthy. Thanks @shakkernerd (#298, #307).
+- Preserve Skill Workshop proposal hashes, support files, and rollback evidence during home import and runtime cleanup. Thanks @Patrick-Erichsen (#245).
+- Reject mixed or malformed candidate preflight failures instead of treating an unsupported-check marker as success. Thanks @shakkernerd for the report and @goutamadwant for the fix (#128, #165).
+- Accept reformatted and binary macOS LaunchAgent plists for the same OCM store while still rejecting foreign or invalid owners. Thanks @TheAngryPit (#147, #149).
+- Reject linked environment archive roots and metadata before import or legacy snapshot restore can read files outside the extracted archive.
+- Keep npm-owned executable updates with npm, prevent temporary npx caches from
+  owning background services, and preserve process identity during npm-launched
+  gateway refreshes. Protect managed and symlinked installer destinations even
+  with `--force`.
+- Refuse mutating `ocm self update` for Homebrew-owned executables and direct
+  users to `brew upgrade openclaw/tap/ocm`; keep release checks available.
 - Keep unrelated supervised gateways on their persisted child specifications when an environment is destroyed, removed, or pruned, so latent metadata or process-environment drift cannot restart sibling gateways during cleanup.
 - Resolve `TMPDIR` from the live OCM daemon whenever a gateway is spawned, create a daemon-scoped private temporary directory, and fall back to a private directory under `/tmp` instead of persisting a per-login path across reboots.
 
