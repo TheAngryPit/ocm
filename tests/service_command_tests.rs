@@ -515,6 +515,223 @@ fn service_start_still_requires_a_managed_service_backend() {
 }
 
 #[test]
+fn service_start_preflight_failure_preserves_daemon_registration() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-start-preflight-failure");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let definition_path = managed_service_definition_path(&env, &cwd, "ocm");
+        let definition_before = fs::read(&definition_path).unwrap();
+        let state_path = supervisor_state_path(&env, &cwd).unwrap();
+        let state_before: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let (binary, log, operation) = if systemd {
+            (
+                "systemctl",
+                "systemctl.log",
+                "\"$2\" = \"show-environment\"",
+            )
+        } else {
+            ("launchctl", "launchctl.log", "\"$1\" = \"managername\"")
+        };
+        let manager_path = root.child(format!("fake-bin/{binary}"));
+        let original = fs::read_to_string(&manager_path).unwrap();
+        let marker = root.child("preflight-failed");
+        write_executable_script(
+            &manager_path,
+            &format!(
+                "#!/bin/sh\nif [ {operation} ] && [ ! -f '{marker}' ]; then\n  : > '{marker}'\n  echo 'injected preflight failure' >&2\n  exit 1\nfi\n{original}",
+                marker = path_string(&marker),
+            ),
+        );
+        fs::write(root.child(log), "").unwrap();
+
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(!started.status.success());
+        assert!(
+            stderr(&started).contains("require a usable"),
+            "{}",
+            stderr(&started)
+        );
+        assert!(marker.exists());
+        assert_eq!(fs::read(&definition_path).unwrap(), definition_before);
+        let state_after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state_after["children"], state_before["children"]);
+        let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert_eq!(json_output(&shown)["serviceEnabled"], true);
+        assert_eq!(json_output(&shown)["serviceRunning"], false);
+        let calls = fs::read_to_string(root.child(log)).unwrap();
+        for line in calls.lines() {
+            assert!(
+                if systemd {
+                    line.starts_with("--user show ")
+                } else {
+                    line.starts_with("print ") || line.starts_with("print-disabled ")
+                },
+                "unexpected manager mutation: {line}"
+            );
+        }
+    }
+}
+
+fn fail_launchctl_enablement_read(root: &TestDir, nth: usize) {
+    let manager_path = root.child("fake-bin/launchctl");
+    let original = fs::read_to_string(&manager_path).unwrap();
+    let counter = root.child("enablement-reads");
+    write_executable_script(
+        &manager_path,
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "print-disabled" ]; then
+  count=0
+  if [ -f '{counter}' ]; then count=$(/bin/cat '{counter}'); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > '{counter}'
+  if [ "$count" -eq {nth} ]; then
+    echo 'injected enablement read failure' >&2
+    exit 1
+  fi
+fi
+{original}"#,
+            counter = path_string(&counter),
+        ),
+    );
+}
+
+#[test]
+fn service_start_read_failures_restore_policy_without_daemon_mutation() {
+    // The first read captures the transaction snapshot, the second decides
+    // whether activation is needed, the third builds the summary, and the fourth
+    // observes readiness with the ordinary readiness path enabled.
+    for failed_read in [2, 3, 4] {
+        let root = TestDir::new("service-start-enablements-read-failure");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = launchd_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        setup_launcher_env(&cwd, &env);
+        let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let definition_path = managed_service_definition_path(&env, &cwd, "ocm");
+        let definition_before = fs::read(&definition_path).unwrap();
+        let state_path = supervisor_state_path(&env, &cwd).unwrap();
+        let state_before: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        fail_launchctl_enablement_read(&root, failed_read);
+        fs::write(root.child("launchctl.log"), "").unwrap();
+
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(!started.status.success());
+        assert!(
+            stderr(&started).contains("injected enablement read failure"),
+            "{}",
+            stderr(&started)
+        );
+        assert!(
+            !stderr(&started).contains("failed to restore"),
+            "{}",
+            stderr(&started)
+        );
+        assert_eq!(fs::read(&definition_path).unwrap(), definition_before);
+        let state_after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state_after["children"], state_before["children"]);
+        let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        assert_eq!(json_output(&shown)["serviceEnabled"], true);
+        assert_eq!(json_output(&shown)["serviceRunning"], false);
+        let calls = fs::read_to_string(root.child("launchctl.log")).unwrap();
+        assert!(
+            !calls.contains("bootout") && !calls.contains("unload") && !calls.contains("bootstrap"),
+            "{calls}"
+        );
+    }
+}
+
+#[test]
+fn service_start_distinguishes_activation_failure_from_summary_failure() {
+    for (installed_before, observation_read) in [
+        (false, None),
+        (true, None),
+        (false, Some(2)),
+        (true, Some(2)),
+        (false, Some(3)),
+        (true, Some(3)),
+    ] {
+        let root = TestDir::new("service-start-partial-activation-failure");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = launchd_env(&root);
+        env.remove("OCM_INTERNAL_SKIP_SERVICE_READINESS");
+        setup_launcher_env(&cwd, &env);
+        let definition_path = managed_service_definition_path(&env, &cwd, "ocm");
+        let definition_before = if installed_before {
+            let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+            assert!(installed.status.success(), "{}", stderr(&installed));
+            fs::remove_file(root.child("launchctl-print.txt")).unwrap();
+            Some(fs::read(&definition_path).unwrap())
+        } else {
+            None
+        };
+        let (marker, expected_error) = if let Some(failed_read) = observation_read {
+            // Activation succeeds; summary or readiness observation then fails.
+            fail_launchctl_enablement_read(&root, failed_read);
+            (
+                root.child("enablement-reads"),
+                "injected enablement read failure",
+            )
+        } else {
+            let manager_path = root.child("fake-bin/launchctl");
+            let original_path = root.child("fake-bin/launchctl-original");
+            fs::rename(&manager_path, &original_path).unwrap();
+            let marker = root.child("activation-failed");
+            write_executable_script(
+                &manager_path,
+                &format!(
+                    "#!/bin/sh\n'{original}' \"$@\"\nresult=$?\nif [ \"$1\" = \"bootstrap\" ] && [ ! -f '{marker}' ]; then\n  : > '{marker}'\n  echo 'injected activation failure' >&2\n  exit 1\nfi\nexit \"$result\"\n",
+                    original = path_string(&original_path),
+                    marker = path_string(&marker),
+                ),
+            );
+
+            (marker, "injected activation failure")
+        };
+
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(!started.status.success());
+        assert!(
+            stderr(&started).contains(expected_error),
+            "{}",
+            stderr(&started)
+        );
+        assert!(
+            !stderr(&started).contains("failed to restore"),
+            "{}",
+            stderr(&started)
+        );
+        assert!(marker.exists());
+        let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+        if observation_read.is_some() {
+            // Only observation failed after a successful activation; the
+            // accepted policy and daemon registration must remain applied.
+            assert!(definition_path.exists());
+            assert!(root.child("launchctl-print.txt").exists());
+            assert_eq!(json_output(&shown)["serviceEnabled"], true);
+            assert_eq!(json_output(&shown)["serviceRunning"], true);
+        } else {
+            assert_eq!(fs::read(&definition_path).ok(), definition_before);
+            assert!(!root.child("launchctl-print.txt").exists());
+            assert_eq!(json_output(&shown)["serviceEnabled"], installed_before);
+            assert_eq!(json_output(&shown)["serviceRunning"], false);
+        }
+    }
+}
+
+#[test]
 fn service_start_marks_the_env_running() {
     let root = TestDir::new("service-start");
     let cwd = root.child("workspace");
