@@ -37,6 +37,9 @@ pub(crate) struct LaunchdJobStatus {
     pub(crate) running: bool,
     pub(crate) enablement: Option<ManagedServiceEnablement>,
     pub(crate) pid: Option<u32>,
+    // Best-effort display keeps an unknown PID empty, but activation must not
+    // mistake a present malformed value for an absent PID on a stopped job.
+    pid_parse_failed: bool,
     pub(crate) state: Option<String>,
     pub(crate) definition_path: Option<String>,
 }
@@ -523,30 +526,73 @@ pub(crate) fn inspect_job(
     service_path: &Path,
     env: &BTreeMap<String, String>,
 ) -> LaunchdJobStatus {
+    inspect_job_inner(label, service_path, env, false).unwrap_or_else(|_| LaunchdJobStatus {
+        installed: service_path.exists(),
+        ..LaunchdJobStatus::default()
+    })
+}
+
+/// Activation needs evidence that the daemon is absent or stopped. Status
+/// display can remain best-effort, but a failed read must never authorize a stop.
+pub(crate) fn inspect_job_for_activation(
+    label: &str,
+    service_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<LaunchdJobStatus, String> {
+    inspect_job_inner(label, service_path, env, true).map_err(|error| {
+        format!("{error}; activation was refused to preserve running services. Restore service-manager access or wait for its state to settle, then retry")
+    })
+}
+
+fn inspect_job_inner(
+    label: &str,
+    service_path: &Path,
+    env: &BTreeMap<String, String>,
+    checked: bool,
+) -> Result<LaunchdJobStatus, String> {
     let mut status = LaunchdJobStatus {
         installed: service_path.exists(),
         ..LaunchdJobStatus::default()
     };
-
+    let unknown = || format!("managed service {label} has an unknown process state");
     match service_manager_kind(env) {
         ServiceManagerKind::Launchd => {
-            let Some(uid) = current_uid() else {
-                return status;
+            let domain = if checked {
+                gui_domain(env)?
+            } else {
+                format!("gui/{}", current_uid().ok_or_else(unknown)?)
             };
-            let target = format!("gui/{uid}/{label}");
             let output = Command::new(launchctl_binary(env))
-                .args(["print", &target])
-                .output();
-            let Ok(output) = output else {
-                return status;
-            };
+                .args(["print", &format!("{domain}/{label}")])
+                .output()
+                .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
             if !output.status.success() {
-                return status;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if checked
+                    && stderr.contains(&format!("Could not find service \"{label}\""))
+                    && stderr.contains("in domain")
+                {
+                    return Ok(status);
+                }
+                return Err(format!(
+                    "failed to inspect managed service {label}: launchctl exited with {}",
+                    output.status
+                ));
             }
-
-            let text = String::from_utf8_lossy(&output.stdout);
             status.loaded = true;
-            parse_launchctl_print(&text, &mut status);
+            parse_launchctl_print(&String::from_utf8_lossy(&output.stdout), &mut status);
+            if checked {
+                status.pid = status.pid.filter(|pid| *pid > 0);
+                let stopped = matches!(
+                    status.state.as_deref(),
+                    Some("not running" | "stopped" | "waiting" | "exited")
+                );
+                if status.pid_parse_failed
+                    || !(status.running && status.pid.is_some() || stopped && status.pid.is_none())
+                {
+                    return Err(unknown());
+                }
+            }
             discard_stale_loaded_job(service_path, &mut status);
         }
         ServiceManagerKind::SystemdUser => {
@@ -557,21 +603,43 @@ pub(crate) fn inspect_job(
                     label,
                     "--property=LoadState,UnitFileState,ActiveState,SubState,MainPID,FragmentPath,ExecStart,WorkingDirectory,Environment",
                 ])
-                .output();
-            let Ok(output) = output else {
-                return status;
+                .output()
+                .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let property = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(str::trim)
             };
-            if !output.status.success() {
-                return status;
+            if checked
+                && property("LoadState=") == Some("not-found")
+                && property("ActiveState=") == Some("inactive")
+                && property("MainPID=") == Some("0")
+            {
+                return Ok(status);
             }
-
-            parse_systemctl_show(&String::from_utf8_lossy(&output.stdout), &mut status);
+            if !output.status.success() {
+                return Err(format!(
+                    "failed to inspect managed service {label}: systemctl exited with {}",
+                    output.status
+                ));
+            }
+            parse_systemctl_show(&text, &mut status);
+            if checked {
+                let stopped = matches!(property("ActiveState="), Some("inactive" | "failed"))
+                    && matches!(property("SubState="), Some("dead" | "exited" | "failed"))
+                    && property("MainPID=") == Some("0");
+                if property("LoadState=") != Some("loaded")
+                    || !(status.running && status.pid.is_some() || stopped)
+                {
+                    return Err(unknown());
+                }
+            }
             discard_stale_loaded_job(service_path, &mut status);
         }
         ServiceManagerKind::Unsupported => {}
     }
-
-    status
+    Ok(status)
 }
 
 /// New foreground ownership needs a confirmed manager observation. The public
@@ -708,8 +776,10 @@ fn parse_launchctl_print(raw: &str, status: &mut LaunchdJobStatus) {
             status.state = Some(value);
             continue;
         }
-        if let Some(value) = trimmed.strip_prefix("pid = ") {
-            status.pid = value.trim().parse::<u32>().ok();
+        if let Some(value) = trimmed.strip_prefix("pid =") {
+            let pid = value.trim().parse::<u32>();
+            status.pid_parse_failed |= pid.is_err();
+            status.pid = pid.ok();
             continue;
         }
         if trimmed.starts_with("OPENCLAW_CONFIG_PATH => ") {
