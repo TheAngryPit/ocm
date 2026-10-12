@@ -4145,6 +4145,250 @@ fn runtime_install_force_rejects_replacing_a_bound_runtime() {
     assert!(!install_root.join("files/openclaw-replacement").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_mutations_preserve_bound_aliases_and_allow_unrelated_or_idle_aliases() {
+    let root = TestDir::new("runtime-bound-alias");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let original = root.child("original/openclaw");
+    let replacement = root.child("replacement/openclaw");
+    write_executable_script(&original, "#!/bin/sh\nprintf '2026.7.1\\n'\n");
+    write_executable_script(&replacement, "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+    let run = |args: &[&str]| run_ocm(&cwd, &env, args);
+    let install = run(&[
+        "runtime",
+        "install",
+        "backing",
+        "--path",
+        &path_string(&original),
+        "--json",
+    ]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let meta: Value = serde_json::from_str(&stdout(&install)).unwrap();
+    let executable = Path::new(meta["binaryPath"].as_str().unwrap());
+    let add = run(&[
+        "runtime",
+        "add",
+        "selected",
+        "--path",
+        &path_string(executable),
+    ]);
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run(&["env", "create", "demo", "--runtime", "selected"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let version = run(&["@demo", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.7.1");
+    let runtime_before = fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap();
+    let original_bytes = fs::read(executable).unwrap();
+    let replacement_path = path_string(&replacement);
+    for (binding, target) in [
+        ("selected", "backing"),
+        ("selected", " backing "),
+        (" selected ", "backing"),
+    ] {
+        // Raw store/import bindings retain accepted noncanonical spellings.
+        let mut meta = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+        meta.default_runtime = Some(binding.to_string());
+        let saved = ocm::store::save_environment(meta, &env, &cwd).unwrap();
+        assert_eq!(saved.default_runtime.as_deref(), Some(binding));
+        let before = run(&["env", "show", "demo", "--json"]);
+        assert!(before.status.success(), "{}", stderr(&before));
+        for args in [
+            vec![
+                "runtime",
+                "install",
+                target,
+                "--path",
+                &replacement_path,
+                "--force",
+            ],
+            vec!["runtime", "remove", target],
+            vec!["runtime", "update", target],
+            vec![
+                "runtime",
+                "build-local",
+                target,
+                "--repo",
+                "missing-repo",
+                "--force",
+            ],
+        ] {
+            let mutation = run(&args);
+            assert_eq!(mutation.status.code(), Some(1), "{args:?}");
+            assert!(
+                stderr(&mutation).contains("still used by environment(s): \"demo\""),
+                "{}",
+                stderr(&mutation)
+            );
+            assert_eq!(fs::read(executable).unwrap(), original_bytes);
+            assert_eq!(
+                fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
+                runtime_before
+            );
+            let after = run(&["env", "show", "demo", "--json"]);
+            assert!(after.status.success(), "{}", stderr(&after));
+            assert_eq!(stdout(&after), stdout(&before));
+        }
+    }
+    let version = run(&["@demo", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.7.1");
+
+    // A stale external registration must not prevent unrelated mutations.
+    let stale = run(&["runtime", "add", "stale", "--path", &path_string(&original)]);
+    assert!(stale.status.success(), "{}", stderr(&stale));
+    let peer = run(&["env", "create", "peer", "--runtime", "stale"]);
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    let peer_before = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_before.status.success(), "{}", stderr(&peer_before));
+    fs::remove_file(&original).unwrap();
+    let other = run(&["runtime", "install", "other", "--path", &replacement_path]);
+    assert!(other.status.success(), "{}", stderr(&other));
+    let remove_other = run(&["runtime", "remove", "other"]);
+    assert!(remove_other.status.success(), "{}", stderr(&remove_other));
+    let peer_after = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_after.status.success(), "{}", stderr(&peer_after));
+    assert_eq!(stdout(&peer_after), stdout(&peer_before));
+
+    // A completely external cycle is unhealthy, but has no managed owner.
+    std::os::unix::fs::symlink("peer", &original).unwrap();
+    std::os::unix::fs::symlink("openclaw", original.with_file_name("peer")).unwrap();
+    let other = run(&["runtime", "install", "other", "--path", &replacement_path]);
+    assert!(other.status.success(), "{}", stderr(&other));
+    let remove_other = run(&["runtime", "remove", "other"]);
+    assert!(remove_other.status.success(), "{}", stderr(&remove_other));
+    let invalid_binding = run(&["env", "create", "invalid", "--runtime", "stale"]);
+    assert!(!invalid_binding.status.success());
+    let peer_after = run(&["env", "show", "peer", "--json"]);
+    assert!(peer_after.status.success(), "{}", stderr(&peer_after));
+    assert_eq!(stdout(&peer_after), stdout(&peer_before));
+
+    // A cycle inside the managed tree must still protect that owner.
+    fs::remove_file(executable).unwrap();
+    std::os::unix::fs::symlink("cycle", executable).unwrap();
+    let managed_cycle = executable.with_file_name("cycle");
+    std::os::unix::fs::symlink("openclaw", &managed_cycle).unwrap();
+    let remove = run(&["runtime", "remove", "backing"]);
+    assert!(!remove.status.success());
+    assert!(
+        stderr(&remove).contains("still used by environment(s): \"demo\""),
+        "{}",
+        stderr(&remove)
+    );
+    assert_eq!(fs::read_link(executable).unwrap(), Path::new("cycle"));
+    assert_eq!(
+        fs::read(runtime_meta_path("backing", &env, &cwd).unwrap()).unwrap(),
+        runtime_before
+    );
+    fs::remove_file(executable).unwrap();
+    fs::remove_file(managed_cycle).unwrap();
+    write_executable_script(executable, std::str::from_utf8(&original_bytes).unwrap());
+
+    let clear = run(&["env", "set-runtime", "demo", "none"]);
+    assert!(clear.status.success(), "{}", stderr(&clear));
+    let replace = run(&[
+        "runtime",
+        "install",
+        "backing",
+        "--path",
+        &replacement_path,
+        "--force",
+    ]);
+    assert!(replace.status.success(), "{}", stderr(&replace));
+    assert_eq!(
+        fs::read(executable).unwrap(),
+        fs::read(&replacement).unwrap()
+    );
+    let remove = run(&["runtime", "remove", "backing"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(!executable.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_mutations_follow_filesystem_name_identity() {
+    let root = TestDir::new("runtime-case-owner");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let source = root.child("source/openclaw");
+    write_executable_script(&source, "#!/bin/sh\nprintf '2026.7.1\\n'\n");
+    let env = ocm_env(&root);
+    let run = |args: &[&str]| run_ocm(&cwd, &env, args);
+    let source_path = path_string(&source);
+    let install = run(&[
+        "runtime",
+        "install",
+        "backing",
+        "--path",
+        &source_path,
+        "--json",
+    ]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let meta: Value = serde_json::from_str(&stdout(&install)).unwrap();
+    let executable = Path::new(meta["binaryPath"].as_str().unwrap());
+    let before_bytes = fs::read(executable).unwrap();
+    let case_sensitive = !runtime_meta_path("BACKING", &env, &cwd).unwrap().exists();
+    if case_sensitive {
+        let other = run(&["runtime", "install", "BACKING", "--path", &source_path]);
+        assert!(other.status.success(), "{}", stderr(&other));
+    } else {
+        let same = run(&["runtime", "show", "BACKING", "--json"]);
+        assert!(same.status.success(), "{}", stderr(&same));
+        assert_eq!(serde_json::from_str::<Value>(&stdout(&same)).unwrap(), meta);
+    }
+    let alias = run(&[
+        "runtime",
+        "add",
+        "selected",
+        "--path",
+        &path_string(executable),
+    ]);
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    let create = run(&["env", "create", "demo", "--runtime", "selected"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let before = run(&["env", "show", "demo", "--json"]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    for args in [
+        vec![
+            "runtime",
+            "install",
+            "BACKING",
+            "--path",
+            &source_path,
+            "--force",
+        ],
+        vec!["runtime", "remove", "BACKING"],
+    ] {
+        let mutation = run(&args);
+        assert_eq!(
+            mutation.status.success(),
+            case_sensitive,
+            "{args:?}: {}",
+            stderr(&mutation)
+        );
+        if !case_sensitive {
+            assert!(
+                stderr(&mutation).contains("still used by environment(s): \"demo\""),
+                "{}",
+                stderr(&mutation)
+            );
+        }
+        assert_eq!(fs::read(executable).unwrap(), before_bytes);
+        let after = run(&["env", "show", "demo", "--json"]);
+        assert!(after.status.success(), "{}", stderr(&after));
+        assert_eq!(stdout(&after), stdout(&before));
+        let runtime = run(&["runtime", "show", "backing", "--json"]);
+        assert!(runtime.status.success(), "{}", stderr(&runtime));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&runtime)).unwrap(),
+            meta
+        );
+    }
+}
+
 #[test]
 fn runtime_install_force_preserves_existing_runtime_when_replacement_fails() {
     let root = TestDir::new("runtime-install-force-rollback");
