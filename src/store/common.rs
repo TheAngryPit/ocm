@@ -208,7 +208,83 @@ pub(crate) fn try_lock_file_shared(
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None)
+    copy_dir_recursive_inner(source, destination, None, None)
+}
+
+pub(crate) fn copy_dir_preserving_permissions(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    copy_dir_recursive_inner(source, destination, None, Some(destination))
+}
+
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    #[cfg(target_os = "macos")]
+    return crate::infra::macos_security::ensure_private_directory(path)
+        .map_err(|error| error.to_string());
+    #[cfg(windows)]
+    return crate::infra::windows_security::ensure_private_directory(path)
+        .map_err(|error| error.to_string());
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => (),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) =>
+            {
+                ()
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn remove_owned_tree(path: &Path) -> Result<(), String> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(entry) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            ensure_private_dir(&entry)?;
+            for child in fs::read_dir(&entry).map_err(|error| error.to_string())? {
+                pending.push(child.map_err(|error| error.to_string())?.path());
+            }
+        }
+        #[cfg(windows)]
+        if metadata.permissions().readonly() {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&entry, permissions).map_err(|error| error.to_string())?;
+        }
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 // Clone and migration opt in; package, archive restore, and checkpoint callers
@@ -237,7 +313,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
     }
 
     pub(crate) fn copy(&mut self, source: &Path, destination: &Path) -> Result<(), String> {
-        copy_dir_recursive_inner(source, destination, Some(self))
+        copy_dir_recursive_inner(source, destination, Some(self), None)
     }
 }
 
@@ -245,8 +321,13 @@ fn copy_dir_recursive_inner(
     source: &Path,
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    private_root: Option<&Path>,
 ) -> Result<(), String> {
-    ensure_dir(destination)?;
+    if private_root.is_some() {
+        ensure_private_dir(destination)?;
+    } else {
+        ensure_dir(destination)?;
+    }
 
     let entries = fs::read_dir(source)
         .map_err(|error| error.to_string())?
@@ -329,10 +410,22 @@ fn copy_dir_recursive_inner(
                     source_path.display()
                 ));
             }
-            copy_path_inner(&source_path, &destination_path, copying.as_deref_mut())?;
+            copy_path_inner(
+                &source_path,
+                &destination_path,
+                copying.as_deref_mut(),
+                private_root,
+            )?;
         }
     }
 
+    if private_root.is_some_and(|root| root != destination) {
+        // Restore nested modes before exposing the containing directory.
+        let permissions = fs::metadata(source)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        fs::set_permissions(destination, permissions).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -349,22 +442,30 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None)
+    copy_path_inner(source, destination, None, None)
 }
 
 fn copy_path_inner(
     source: &Path,
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    private_root: Option<&Path>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
-        return copy_symlink(source, destination);
+        #[cfg(windows)]
+        let directory_hint = private_root.map(|_| {
+            use std::os::windows::fs::FileTypeExt;
+            file_type.is_symlink_dir()
+        });
+        #[cfg(not(windows))]
+        let directory_hint = None;
+        return copy_symlink(source, destination, directory_hint);
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, copying);
+        return copy_dir_recursive_inner(source, destination, copying, private_root);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
@@ -378,7 +479,11 @@ fn copy_path_inner(
         .map_err(|error| error.to_string())
 }
 
-fn copy_symlink(source_path: &Path, destination_path: &Path) -> Result<(), String> {
+fn copy_symlink(
+    source_path: &Path,
+    destination_path: &Path,
+    _directory_hint: Option<bool>,
+) -> Result<(), String> {
     if let Some(parent) = destination_path.parent() {
         ensure_dir(parent)?;
     }
@@ -390,9 +495,13 @@ fn copy_symlink(source_path: &Path, destination_path: &Path) -> Result<(), Strin
     }
     #[cfg(windows)]
     {
-        std::os::windows::fs::symlink_file(&target, destination_path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, destination_path))
-            .map_err(|error| error.to_string())?;
+        match _directory_hint {
+            Some(true) => std::os::windows::fs::symlink_dir(&target, destination_path),
+            Some(false) => std::os::windows::fs::symlink_file(&target, destination_path),
+            None => std::os::windows::fs::symlink_file(&target, destination_path)
+                .or_else(|_| std::os::windows::fs::symlink_dir(&target, destination_path)),
+        }
+        .map_err(|error| error.to_string())?;
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -800,5 +909,152 @@ mod tests {
                 .unwrap(),
             42
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod archive_privacy_tests {
+    use super::*;
+    use crate::infra::archive::{EnvArchiveOptions, write_env_archive_with_options};
+    use crate::infra::macos_security::file_has_no_extended_acl;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_archive_directories_and_output_exclude_inherited_acl() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("shared-parent");
+        fs::create_dir(&parent).unwrap();
+        let granted = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+            .arg(&parent).status().unwrap();
+        assert!(granted.success());
+        let existing = parent.join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert!(!file_has_no_extended_acl(&File::open(&existing).unwrap()).unwrap());
+        for directory in [existing, parent.join("new")] {
+            ensure_private_dir(&directory).unwrap();
+            assert!(file_has_no_extended_acl(&File::open(&directory).unwrap()).unwrap());
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), b"private fixture").unwrap();
+        let output = parent.join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(file_has_no_extended_acl(&File::open(&output).unwrap()).unwrap());
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod archive_privacy_windows_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    #[test]
+    fn private_config_state_archive_directory_links_round_trip() {
+        use crate::infra::archive::{
+            EnvArchiveOptions, extract_env_archive, restore_env_archive_directory_permissions,
+            write_env_archive_with_options,
+        };
+        use std::collections::BTreeSet;
+        use std::os::windows::fs::FileTypeExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let data = home.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let database = rusqlite::Connection::open(data.join("records.db")).unwrap();
+        database.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('retained');").unwrap();
+        let link = home.join("history");
+        let created = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&data)
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let output = root.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &home,
+            &output,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        drop(database);
+        fs::rename(&home, root.path().join("offline")).unwrap();
+        let staging = root.path().join("staging");
+        ensure_private_dir(&staging).unwrap();
+        let extracted = extract_env_archive::<serde_json::Value>(&output, &staging).unwrap();
+        restore_env_archive_directory_permissions(&output, &staging).unwrap();
+        assert!(
+            fs::symlink_metadata(extracted.root_dir.join("history"))
+                .unwrap()
+                .file_type()
+                .is_symlink_dir()
+        );
+        let target = root.path().join("target");
+        copy_dir_preserving_permissions(&extracted.root_dir, &target).unwrap();
+        assert!(
+            fs::symlink_metadata(target.join("history"))
+                .unwrap()
+                .file_type()
+                .is_symlink_dir()
+        );
+        let restored =
+            rusqlite::Connection::open(target.join("history").join("records.db")).unwrap();
+        assert_eq!(
+            restored
+                .query_row("SELECT value FROM entries", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+    }
+
+    #[test]
+    fn private_config_archive_directory_has_user_only_access() {
+        let root = tempfile::tempdir().unwrap();
+        for existing in [false, true] {
+            let directory = root.path().join(if existing { "existing" } else { "new" });
+            if existing {
+                fs::create_dir(&directory).unwrap();
+            }
+            ensure_private_dir(&directory).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(directory)
+                .unwrap();
+            assert!(
+                crate::infra::windows_security::has_user_only_access(&file).unwrap(),
+                "existing directory: {existing}"
+            );
+        }
     }
 }

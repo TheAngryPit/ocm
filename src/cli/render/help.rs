@@ -480,7 +480,7 @@ pub fn adopt_command_help(cmd: &str, action: &str) -> Option<String> {
                 "This creates a managed env and rewrites env-scoped OpenClaw paths for the new target.",
                 "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
                 "A copied public MCP app sandbox origin is removed unless --sandbox-origin supplies a dedicated origin for the new env.",
-                "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",
+                "For a default import or explicit --sandbox-origin override, flatten any config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin section owned by $include before OCM rewrites the origin.",
                 "If `openclaw` is already available on PATH, import also binds the env to an env-local migrated launcher so it is immediately runnable through OCM.",
             ],
         )),
@@ -1309,10 +1309,14 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             "Export an environment",
             "Write a portable environment archive that can be imported later.",
             vec![format!(
-                "{cmd} env export <name> [--output <path>] [--raw] [--json]"
+                "{cmd} env export <name> [--output <path>] [--include-state] [--raw] [--json]"
             )],
             &[
                 ("--output <path>", "Write the archive to a specific path"),
+                (
+                    "--include-state",
+                    "Export this environment as the same installation, with SQLite snapshots",
+                ),
                 (
                     "--raw",
                     "Force plain line output instead of the TTY receipt view",
@@ -1351,10 +1355,11 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                 "The new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
                 "OCM checks root overlap before creating or copying environment state.",
                 "The destination root must not overlap registered dev sources, including aliases and missing borrowed paths.",
-                "Import rewrites env-scoped OpenClaw config paths for the new root.",
-                "Import removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
-                "If the config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin is owned by $include, flatten that section before importing so OCM can reset the origin without changing include ownership.",
-                "Import keeps durable agent auth/settings, but clears copied runtime residue like sessions, logs, and backups.",
+                "Import rewrites env-scoped OpenClaw config paths for the new root, except in state-inclusive archives.",
+                "State-inclusive archives preserve file contents; --sandbox-origin explicitly replaces that setting.",
+                "Import of archives without included state removes a copied public MCP app sandbox origin unless --sandbox-origin supplies a dedicated origin for the imported env.",
+                "For a default import or explicit --sandbox-origin override, flatten any config root, mcp, mcp.apps, or mcp.apps.sandboxOrigin section owned by $include before OCM rewrites the origin.",
+                "Without included state, import keeps durable agent auth/settings but clears copied runtime residue like sessions, logs, and backups.",
             ],
         ),
         "list" => render_leaf(

@@ -116,7 +116,7 @@ pub(crate) fn openclaw_env_archive_options(
 ) -> Result<EnvArchiveOptions, String> {
     let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
     let included_path_roots = workspaces.archive_relative_roots(&paths.root)?;
-    let mut excluded_path_roots = openclaw_archive_excluded_path_roots(paths)?;
+    let mut excluded_path_roots = openclaw_archive_excluded_path_roots(paths, false)?;
     excluded_path_roots.extend(openclaw_workspace_archive_excluded_path_roots(
         paths,
         &workspaces,
@@ -126,7 +126,57 @@ pub(crate) fn openclaw_env_archive_options(
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
+        ..EnvArchiveOptions::default()
     })
+}
+
+pub(crate) fn openclaw_env_state_archive_options(
+    paths: &EnvPaths,
+) -> Result<EnvArchiveOptions, String> {
+    // This mode archives files without interpreting OpenClaw configuration.
+    // Do not follow linked directories while discovering rebuildable debris.
+    let excluded_path_roots = if fs::symlink_metadata(&paths.state_dir)
+        .is_ok_and(|meta| meta.is_dir())
+        && fs::symlink_metadata(paths.state_dir.join("extensions")).is_ok_and(|meta| meta.is_dir())
+    {
+        openclaw_archive_excluded_path_roots(paths, true)?
+    } else {
+        BTreeSet::new()
+    };
+    Ok(EnvArchiveOptions {
+        excluded_path_roots,
+        should_exclude_path: should_exclude_state_archive_path,
+        sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+        snapshot_sqlite_files: true,
+        relocate_internal_symlinks: true,
+        private_output: true,
+        ..EnvArchiveOptions::default()
+    })
+}
+
+fn should_exclude_state_archive_path(path: &Path, kind: EnvArchiveEntryKind) -> bool {
+    let name = path.file_name().unwrap_or_default();
+    if path.parent() == Some(Path::new(".openclaw"))
+        && kind == EnvArchiveEntryKind::Directory
+        && matches!(
+            name.to_str(),
+            Some(
+                "plugin-runtime-deps"
+                    | "bundled-plugin-runtime-deps"
+                    | ".openclaw-pnpm-store"
+                    | ".openclaw-npm-cache"
+            )
+        )
+    {
+        return true;
+    }
+    kind == EnvArchiveEntryKind::Other
+        || (path.parent() == Some(Path::new(".openclaw"))
+            && super::snapshots::is_snapshot_process_residue(
+                name,
+                kind == EnvArchiveEntryKind::Directory,
+            ))
+        || (kind == EnvArchiveEntryKind::Directory && path.ends_with(".openclaw/tmp"))
 }
 
 #[cfg(test)]
@@ -1073,11 +1123,16 @@ fn is_durable_openclaw_archive_path(components: &[&str]) -> bool {
     )
 }
 
-fn openclaw_archive_excluded_path_roots(paths: &EnvPaths) -> Result<BTreeSet<PathBuf>, String> {
-    Ok(openclaw_extension_runtime_debris_roots(&paths.state_dir)?
-        .into_iter()
-        .map(|path| Path::new(".openclaw").join(path))
-        .collect())
+fn openclaw_archive_excluded_path_roots(
+    paths: &EnvPaths,
+    typed: bool,
+) -> Result<BTreeSet<PathBuf>, String> {
+    Ok(
+        openclaw_extension_runtime_debris_roots_with_types(&paths.state_dir, typed)?
+            .into_iter()
+            .map(|path| Path::new(".openclaw").join(path))
+            .collect(),
+    )
 }
 
 fn openclaw_workspace_archive_excluded_path_roots(
@@ -1101,6 +1156,13 @@ fn openclaw_workspace_archive_excluded_path_roots(
 }
 
 fn openclaw_extension_runtime_debris_roots(state_dir: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    openclaw_extension_runtime_debris_roots_with_types(state_dir, false)
+}
+
+fn openclaw_extension_runtime_debris_roots_with_types(
+    state_dir: &Path,
+    typed: bool,
+) -> Result<BTreeSet<PathBuf>, String> {
     let extensions_root = state_dir.join("extensions");
     let entries = match fs::read_dir(&extensions_root) {
         Ok(entries) => entries,
@@ -1120,9 +1182,13 @@ fn openclaw_extension_runtime_debris_roots(state_dir: &Path) -> Result<BTreeSet<
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        let has_runtime_deps_marker = children
-            .iter()
-            .any(|child| is_openclaw_runtime_dependency_marker(&child.file_name()));
+        let has_runtime_deps_marker = children.iter().any(|child| {
+            is_openclaw_runtime_dependency_marker(&child.file_name())
+                && (!typed
+                    || child
+                        .file_type()
+                        .is_ok_and(|kind| runtime_dependency_entry_kind(&child.file_name(), &kind)))
+        });
         let plugin_relative_root = Path::new("extensions").join(entry.file_name());
 
         for child in children {
@@ -1130,12 +1196,34 @@ fn openclaw_extension_runtime_debris_roots(state_dir: &Path) -> Result<BTreeSet<
             if is_openclaw_legacy_dependency_debris(&name)
                 || (name == OsStr::new("node_modules") && has_runtime_deps_marker)
             {
+                if typed {
+                    let kind = child.file_type().map_err(|error| error.to_string())?;
+                    let expected_kind = if is_openclaw_runtime_dependency_marker(&name) {
+                        runtime_dependency_entry_kind(&name, &kind)
+                    } else {
+                        kind.is_dir()
+                    };
+                    if !expected_kind {
+                        continue;
+                    }
+                }
                 excluded.insert(plugin_relative_root.join(name));
             }
         }
     }
 
     Ok(excluded)
+}
+
+fn runtime_dependency_entry_kind(name: &OsStr, kind: &fs::FileType) -> bool {
+    if matches!(
+        name.to_str(),
+        Some(".openclaw-runtime-deps.json" | ".openclaw-runtime-deps-stamp.json")
+    ) {
+        kind.is_file()
+    } else {
+        kind.is_dir()
+    }
 }
 
 fn is_openclaw_runtime_dependency_marker(name: &OsStr) -> bool {

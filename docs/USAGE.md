@@ -939,15 +939,43 @@ Export:
 
 ```bash
 ocm env export mira
+ocm env export mira --include-state --output ./mira-with-state.ocm-env.tar
 ```
 
 Import:
 
 ```bash
-ocm env import ./mira.tar --name rowan
+ocm env import ./mira-with-state.ocm-env.tar --name rowan
 ```
 
-Imported environments get a fresh identity, have env-scoped OpenClaw config rewritten for the new root, and keep durable agent settings while clearing copied runtime residue like sessions, logs, and backup files.
+Export omits `.openclaw/state` by default. `--include-state` means "export this
+environment as the same installation": it includes every file under the
+environment root, including plugin payloads and dependencies, SQLite-backed and
+file-based sessions, and unrelated or legacy data. Only non-durable process
+files and rebuildable runtime debris are excluded, using the snapshot rules
+for sockets, pids, locks and temporary directories, plus extension dependency
+caches and workspace runtime debris. Each SQLite database anywhere under the
+root is captured as a coherent committed snapshot, including uncheckpointed WAL
+writes; raw database sidecars are omitted. Databases and other files are not
+captured in one atomic transaction.
+
+State-inclusive export and import copy configuration files and database contents
+without resolving or rewriting them. `.env`, `openclaw.json`, includes, and
+plugin load-path expressions travel verbatim. No OpenClaw runtime is required.
+Paths outside the environment root are not exported, detected, or reported;
+absolute paths in file contents may need updating after moving the environment.
+Owned file and directory links use relative targets in the archive; external
+and dangling links retain their targets without copying external contents.
+State-inclusive archives are created with private access. Import preserves
+directory modes under a private environment root and leaves it stopped;
+export leaves the source unchanged.
+Archive ownership and extended ACLs are not transferred; the private root
+prevents broader access when those restrictions cannot be reproduced.
+An explicit `env import --sandbox-origin` still replaces that setting.
+
+JSON reports `includeState`; the human summary also reports whether state was
+included. Export without the flag and import of older archives retain their
+existing selection, configuration rewriting, and cleanup behavior.
 
 Environment archives must contain real `meta/` and `root/` directories and a
 regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks

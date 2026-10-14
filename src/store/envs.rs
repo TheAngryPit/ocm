@@ -32,7 +32,9 @@ use super::layout::{
     resolve_absolute_path, resolve_store_paths, validate_name,
 };
 use super::now_utc;
-use super::openclaw_state::validate_nonportable_runtime_state_paths;
+use super::openclaw_state::{
+    openclaw_env_state_archive_options, validate_nonportable_runtime_state_paths,
+};
 use super::{
     DevSourceRegistration, OpenClawWorkspaceRuntime, clear_nonportable_runtime_state,
     normalize_new_environment_sandbox_origin, openclaw_config_include_paths,
@@ -1046,6 +1048,7 @@ pub fn export_environment(
     }
 
     let metadata = EnvArchiveMetadata {
+        include_state: options.include_state,
         kind: "ocm-env-archive".to_string(),
         format_version: 1,
         exported_at: now_utc(),
@@ -1065,22 +1068,21 @@ pub fn export_environment(
         },
     };
 
-    let result = write_env_archive_with_options(
-        &metadata,
-        &env_paths.root,
-        &output_path,
-        openclaw_env_archive_options(
-            &env_paths,
-            env,
-            OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port),
-        )?,
-    );
-    if result.is_err() {
+    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
+    let archive_options = if options.include_state {
+        openclaw_env_state_archive_options(&env_paths)?
+    } else {
+        openclaw_env_archive_options(&env_paths, env, runtime)?
+    };
+    let result =
+        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
+    if result.is_err() && !options.include_state {
         let _ = fs::remove_file(&output_path);
     }
     result?;
 
     Ok(EnvExportSummary {
+        include_state: options.include_state,
         name: meta.name,
         root: meta.root,
         archive_path: display_path(&output_path),
@@ -1108,10 +1110,11 @@ pub(crate) fn import_environment_with_sandbox_origin(
     let archive_path = resolve_absolute_path(&options.archive, env, cwd)?;
     let staging_dir = import_staging_dir();
     if path_exists(&staging_dir) {
-        let _ = fs::remove_dir_all(&staging_dir);
+        let _ = super::common::remove_owned_tree(&staging_dir);
     }
 
     let result = (|| {
+        super::common::ensure_private_dir(&staging_dir)?;
         let extracted = extract_env_archive::<EnvArchiveMetadata>(&archive_path, &staging_dir)?;
         if extracted.metadata.kind != "ocm-env-archive" {
             return Err(format!(
@@ -1124,6 +1127,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 "unsupported archive format version: {}",
                 extracted.metadata.format_version
             ));
+        }
+
+        if extracted.metadata.include_state {
+            crate::infra::archive::restore_env_archive_directory_permissions(
+                &archive_path,
+                &staging_dir,
+            )?;
         }
 
         let source_name = extracted.metadata.env.name.clone();
@@ -1169,14 +1179,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
             return Err("archive is missing root/".to_string());
         }
         let extracted_paths = derive_env_paths(&extracted.root_dir);
-        validate_nonportable_runtime_state_paths(&extracted_paths)?;
-        reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
-        reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
-        let extracted_workspaces = resolve_env_openclaw_workspaces(
-            &extracted_paths,
-            env,
-            OpenClawWorkspaceRuntime::for_env(&source_name, extracted.metadata.env.gateway_port),
-        )?;
+        let extracted_workspaces = if extracted.metadata.include_state {
+            None
+        } else {
+            validate_nonportable_runtime_state_paths(&extracted_paths)?;
+            reject_include_owned_sandbox_origin(&extracted_paths.config_path)?;
+            reject_include_owned_agent_workspaces(&extracted_paths.config_path)?;
+            Some(resolve_env_openclaw_workspaces(
+                &extracted_paths,
+                env,
+                OpenClawWorkspaceRuntime::for_env(
+                    &source_name,
+                    extracted.metadata.env.gateway_port,
+                ),
+            )?)
+        };
         let imported = (|| {
             let preferred_gateway_port = extracted
                 .metadata
@@ -1186,29 +1203,46 @@ pub(crate) fn import_environment_with_sandbox_origin(
             let gateway_port =
                 choose_available_gateway_port(preferred_gateway_port, &registry.envs, env);
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
-            copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
-            validate_nonportable_runtime_state_paths(&target_paths)?;
-            reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-            let config_rewrite = rewrite_openclaw_config_for_new_environment(
-                &target_paths,
-                extracted.metadata.env.source_root.as_deref().map(Path::new),
-                Some(gateway_port),
-                sandbox_origin.as_deref(),
-            )?;
-            rewrite_identity_bound_workspace_paths_for_target(
-                &target_paths.config_path,
-                &extracted_workspaces,
-                &extracted.root_dir,
-                &target_paths.root,
-            )?;
-            verify_copied_workspaces_remain_preserved(
-                &extracted_workspaces,
-                &extracted.root_dir,
-                &target_paths,
-                env,
-                target_runtime,
-            )?;
-            clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
+            if extracted.metadata.include_state {
+                super::common::copy_dir_preserving_permissions(
+                    &extracted.root_dir,
+                    &target_paths.root,
+                )?;
+            } else {
+                copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+            }
+            let config_rewrite = if let Some(extracted_workspaces) = &extracted_workspaces {
+                validate_nonportable_runtime_state_paths(&target_paths)?;
+                reject_include_owned_sandbox_origin(&target_paths.config_path)?;
+                let outcome = rewrite_openclaw_config_for_new_environment(
+                    &target_paths,
+                    extracted.metadata.env.source_root.as_deref().map(Path::new),
+                    Some(gateway_port),
+                    sandbox_origin.as_deref(),
+                )?;
+                rewrite_identity_bound_workspace_paths_for_target(
+                    &target_paths.config_path,
+                    extracted_workspaces,
+                    &extracted.root_dir,
+                    &target_paths.root,
+                )?;
+                verify_copied_workspaces_remain_preserved(
+                    extracted_workspaces,
+                    &extracted.root_dir,
+                    &target_paths,
+                    env,
+                    target_runtime,
+                )?;
+                clear_nonportable_runtime_state(&target_paths, env, target_runtime)?;
+                outcome
+            } else {
+                // Preserve authored files unless the caller explicitly overrides the origin.
+                if let Some(origin) = sandbox_origin.as_deref() {
+                    validate_nonportable_runtime_state_paths(&target_paths)?;
+                    super::openclaw_config::replace_imported_sandbox_origin(&target_paths, origin)?;
+                }
+                super::openclaw_config::OpenClawConfigRewriteOutcome::default()
+            };
 
             let created_at = now_utc();
             let meta = EnvMeta {
@@ -1249,13 +1283,21 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 sandbox_port: config_rewrite.sandbox_port,
             }),
             Err(error) => {
-                let _ = fs::remove_dir_all(&target_paths.root);
+                if extracted.metadata.include_state {
+                    if let Err(cleanup) = super::common::remove_owned_tree(&target_paths.root) {
+                        return Err(format!(
+                            "{error}; failed to remove incomplete imported environment: {cleanup}"
+                        ));
+                    }
+                } else {
+                    let _ = fs::remove_dir_all(&target_paths.root);
+                }
                 Err(error)
             }
         }
     })();
 
-    let _ = fs::remove_dir_all(&staging_dir);
+    let _ = super::common::remove_owned_tree(&staging_dir);
     result
 }
 

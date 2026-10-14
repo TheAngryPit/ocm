@@ -527,21 +527,51 @@ Keep the copy's configured external workspace paths pointed at the intended sour
 Keep the original home and linked external data intact; do not remove the link's target directory or its contents.
 
 Environment clone, export, and import flows preserve managed OpenClaw plugin
-payloads under the legacy, extension, npm, and Git install roots. Clone and
-import still clear live sessions, logs, backups, and process residue so the new
+payloads under the legacy, extension, npm, and Git install roots. Clone and default archive
+import clear legacy file-based sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source. New clones also
 clear copied agent database process leases while keeping the state database,
 durable rows, and source leases unchanged.
 
-Clone and import reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
-Individual agent directory links are removed from the copy without changing their linked source data.
+Use `ocm env export <env> --include-state --output <archive>` to export this
+environment as the same installation, then restore it with
+`ocm env import <archive> --name <new-env>`. The flag retains every file under
+the environment root, including OpenClaw state, plugin payloads and dependencies,
+sessions, and unrelated or legacy data. It excludes non-durable process files
+and rebuildable runtime debris using the snapshot rules. SQLite databases
+anywhere under the root are captured as coherent committed snapshots, including
+WAL writes; raw database sidecars are omitted. Each database is captured
+independently, not as one transaction across the environment.
+
+State-inclusive export and import copy configuration files and database contents
+without resolving or rewriting them. `.env`, `openclaw.json`, includes, and
+plugin load-path expressions travel verbatim. No OpenClaw runtime is required.
+Paths outside the environment root are not exported, detected, or reported;
+absolute paths in file contents may need updating after moving the environment.
+Owned file and directory links use relative targets in the archive; external
+and dangling links retain their targets without copying external contents.
+State-inclusive archives are created with private access. Import preserves
+directory modes under a private environment root and leaves it stopped;
+export leaves the source unchanged.
+Archive ownership and extended ACLs are not transferred; the private root
+prevents broader access when those restrictions cannot be reproduced.
+An explicit `env import --sandbox-origin` still replaces that setting.
+
+JSON reports `includeState`; the human summary also reports whether state was
+included. Export without the flag and import of older archives retain their
+existing selection, configuration rewriting, and cleanup behavior.
+
+Clone and imports without state reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
+Clone and imports without state remove individual agent directory links from
+the copy without changing their linked source data.
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.
 Agent database paths recorded in the source shared-state registry are also included when the existing copy traverses them.
 Each database is a coherent committed snapshot; databases and other files are not captured in one atomic transaction.
 The source stays running and its database contents are not rewritten.
 
-OCM does not classify a package or project asset as operational merely because it has a SQLite header or filename.
+For clone, migration, and adoption, OCM does not classify a package or project
+asset as operational merely because it has a SQLite header or filename.
 Unregistered custom database locations and opaque package, project, import, audit, and Workshop payloads retain their existing copy behavior.
 Symlinks keep their existing handling.
 A selected database that cannot be snapshotted makes the command fail and invokes its existing target cleanup; raw source WAL or journal files are never attached to its snapshot.
