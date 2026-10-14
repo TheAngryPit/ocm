@@ -365,7 +365,7 @@ fn state_import_rejects_invalid_config_and_preserves_readonly_directories() {
 }
 
 #[test]
-fn state_import_relocates_config_and_preserves_archive_state_bytes() {
+fn state_import_relocates_config_and_retains_other_state_bytes() {
     use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive};
     use serde_json::{Value, json};
 
@@ -485,10 +485,13 @@ fn state_import_relocates_config_and_preserves_archive_state_bytes() {
         actual["mcp"]["apps"]["sandboxPort"].as_u64(),
         meta["gatewayPort"].as_u64().map(|port| port + 1)
     );
-    for path in retained
-        .into_iter()
-        .chain([".openclaw/state/openclaw.sqlite"])
-    {
+    let copied_database =
+        rusqlite::Connection::open(target.join(".openclaw/state/openclaw.sqlite")).unwrap();
+    let receipt: String = copied_database
+        .query_row("SELECT path FROM receipts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(receipt, target.join("entry.mjs").display().to_string());
+    for path in retained {
         let archived = fs::read(extracted.root_dir.join(path)).unwrap();
         let expected = if matches!(
             path,
@@ -622,7 +625,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             "manifestPath": installed.join("openclaw.plugin.json"),
             "packageJson": {"path": installed.join("package.json"),
                 "fileSignature": {"mtimeMs": "PRECISE_TIMESTAMP"}}
-        }, {"id":"reentered", "rootDir":reentered}]);
+        }, {"id":"reentered", "rootDir":reentered, "setupSource":reentered}, {"id":"external-setup", "setupSource":source.join("../outside/setup.js")}]);
         let plugins_raw = plugins
             .to_string()
             .replace("\"PRECISE_TIMESTAMP\"", "1791960884534.1313");
@@ -650,7 +653,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             )
             .unwrap();
             db.execute("UPDATE installed_plugin_index SET plugins_json=?1, diagnostics_json=?2, workspace_dir=?3 WHERE index_key='installed-plugin-index'",
-                [&plugins_raw, &diagnostics_raw, source.to_str().unwrap()]).unwrap();
+                [&plugins_raw, &diagnostics_raw, source.join("../source/workspace").to_str().unwrap()]).unwrap();
             (
                 "SELECT install_records_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'",
                 records.clone(),
@@ -928,7 +931,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             db.query_row("SELECT original FROM receipt_history", [], |row| row
                 .get::<_, String>(0))
                 .unwrap(),
-            original_document
+            raw
         );
         let mut expected = expected_document;
         let expected_records = if legacy {
@@ -939,10 +942,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
         expected_records["reentered"]["installPath"] = json!(target.join("plugin"));
         expected_records["demo"]["installPath"] = json!(target.join(".openclaw/extensions/demo"));
         expected_records["demo"]["sourcePath"] = json!(target.join("packages/demo"));
+        expected_records["demo"]["unknown"]["path"] = json!(target.join("historical-reference"));
         expected_records["missing"]["installPath"] =
             json!(target.join(".openclaw/extensions/missing"));
         if !legacy {
             expected["index"]["plugins"][1]["rootDir"] = json!(target.join("plugin"));
+            expected["index"]["plugins"][1]["setupSource"] = json!(target.join("plugin"));
             expected["index"]["plugins"][0]["rootDir"] =
                 json!(target.join(".openclaw/extensions/demo"));
             expected["index"]["plugins"][0]["source"] =
@@ -960,6 +965,10 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                     .join("package.json")
             );
             expected["index"]["workspaceDir"] = json!(target);
+            expected["index"]["diagnostics"][0]["message"] = json!(format!(
+                "loaded from {}",
+                target.join(".openclaw/extensions/demo").display()
+            ));
         }
         let source_encoded = serde_json::to_string(source.to_str().unwrap()).unwrap();
         let target_encoded = serde_json::to_string(target.to_str().unwrap()).unwrap();
@@ -984,6 +993,11 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
             assert!(stored_plugins.contains("1791960884534.1313"));
             let parsed: Value = serde_json::from_str(&stored_plugins).unwrap();
             assert_eq!(parsed[1]["rootDir"], json!(target.join("plugin")));
+            assert_eq!(parsed[1]["setupSource"], json!(target.join("plugin")));
+            assert_eq!(
+                parsed[2]["setupSource"],
+                json!(source.join("../outside/setup.js"))
+            );
             assert_eq!(
                 parsed[0]["rootDir"],
                 json!(target.join(".openclaw/extensions/demo"))
@@ -1004,9 +1018,12 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                         .join("openclaw.plugin.json")
                 )
             );
-            assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.to_str().unwrap());
+            assert_eq!(db.query_row("SELECT workspace_dir FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get::<_, String>(0)).unwrap(), target.join("workspace").to_str().unwrap());
             let diagnostics: String = db.query_row("SELECT diagnostics_json FROM installed_plugin_index WHERE index_key='installed-plugin-index'", [], |row| row.get(0)).unwrap();
-            assert_eq!(diagnostics, diagnostics_raw);
+            assert_eq!(
+                diagnostics,
+                diagnostics_raw.replace(source_encoded, target_encoded)
+            );
         } else {
             assert!(raw.contains("1791960884534.1313"));
         }
@@ -1022,7 +1039,7 @@ fn state_import_relocates_plugin_receipts_and_runtime_references_only() {
                 row.get::<_, i64>(1)?
             )))
             .unwrap(),
-            (source.display().to_string(), 43)
+            (target.display().to_string(), 43)
         );
         let timestamp_query = if legacy {
             "SELECT updated_at FROM installed_plugin_index WHERE index_key='installed-plugin-index'"
