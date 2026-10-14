@@ -222,6 +222,7 @@ pub(crate) fn prepare_migrated_runtime_state(
         &workspaces,
         source_state_root,
         &paths.state_dir,
+        false,
     )?;
     let plugin_paths = relocate_installed_plugin_index_paths(
         &paths.state_dir.join("state/openclaw.sqlite"),
@@ -240,6 +241,39 @@ pub(crate) fn prepare_migrated_runtime_state(
         changed,
         external_plugin_ids: plugin_paths.external_plugin_ids,
     })
+}
+
+pub(super) fn relocate_archived_runtime_state(
+    paths: &EnvPaths,
+    source_root: &Path,
+    env: &BTreeMap<String, String>,
+    runtime: OpenClawWorkspaceRuntime<'_>,
+) -> Result<bool, String> {
+    if source_root.as_os_str().is_empty() {
+        return Err("archive source root is empty".to_string());
+    }
+    if source_root == paths.root {
+        return Ok(false);
+    }
+    if !path_exists(&paths.state_dir) {
+        return Ok(false);
+    }
+    let workspaces = resolve_env_openclaw_workspaces(paths, env, runtime)?;
+    let changed = rewrite_runtime_state_root_refs(
+        &paths.state_dir,
+        &paths.config_path,
+        &workspaces,
+        source_root,
+        &paths.root,
+        true,
+    )?;
+    let plugin_paths = relocate_installed_plugin_index_paths(
+        &paths.state_dir.join("state/openclaw.sqlite"),
+        source_root,
+        &paths.root,
+        PluginPathRelocation::Archived,
+    )?;
+    Ok(changed || plugin_paths.changed)
 }
 
 pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
@@ -324,6 +358,7 @@ fn rewrite_runtime_state_root_refs(
     workspaces: &OpenClawWorkspaceInventory,
     source_state_root: &Path,
     target_state_root: &Path,
+    archived: bool,
 ) -> Result<bool, String> {
     let mut changed = false;
     let source_root = display_path(source_state_root);
@@ -335,6 +370,7 @@ fn rewrite_runtime_state_root_refs(
         workspaces,
         &source_root,
         &target_root,
+        archived,
         &mut changed,
     )?;
     Ok(changed)
@@ -347,16 +383,20 @@ fn rewrite_runtime_state_root_refs_inner(
     workspaces: &OpenClawWorkspaceInventory,
     source_root: &str,
     target_root: &str,
+    archived: bool,
     changed: &mut bool,
 ) -> Result<(), String> {
     if !path_exists(root) {
         return Ok(());
     }
 
-    let entries = fs::read_dir(root).map_err(|error| error.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
+    // DirEntry can retain its ReadDir handle. Collect paths before recursing.
+    let paths = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for path in paths {
         if path == config_path || workspaces.contains(&path) {
             continue;
         }
@@ -370,6 +410,7 @@ fn rewrite_runtime_state_root_refs_inner(
                 workspaces,
                 source_root,
                 target_root,
+                archived,
                 changed,
             )?;
             continue;
@@ -378,18 +419,774 @@ fn rewrite_runtime_state_root_refs_inner(
             continue;
         }
 
+        if archived && is_sqlite_database(&path)? {
+            // SQLite values are handled through their owning table, never as text.
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let rewritten = raw.replace(source_root, target_root);
+        // Retained records keep their format when backup, reset, deletion or
+        // migration suffixes are appended to the original filename.
+        let json_lines = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                name.split('.')
+                    .any(|part| matches!(part, "jsonl" | "ndjson"))
+            });
+        let rewritten =
+            rewrite_runtime_root_references(&raw, source_root, target_root, json_lines)?;
         if rewritten == raw {
             continue;
         }
-        fs::write(&path, rewritten).map_err(|error| error.to_string())?;
+        let write = || fs::write(&path, rewritten).map_err(|error| error.to_string());
+        if archived {
+            with_owner_write_permission(&path, write)?;
+        } else {
+            write()?;
+        }
         *changed = true;
     }
 
     Ok(())
+}
+
+fn rewrite_runtime_root_references(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+    json_lines: bool,
+) -> Result<String, String> {
+    if !json_lines {
+        let document = serde_json::from_str::<serde::de::IgnoredAny>(raw);
+        if document.is_ok() {
+            return rewrite_root_reference_value(raw, source_root, target_root);
+        }
+        if document.is_err_and(|error| error.is_eof())
+            && raw.trim_start().starts_with(['{', '[', '"'])
+        {
+            return Ok(raw.to_string());
+        }
+    }
+    // Frame serialized records here, never after decoding a JSON string.
+    // Contiguous legacy text remains a whole value, including quoted newlines.
+    let mut output = String::with_capacity(raw.len());
+    let mut text_start = 0;
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        let parsed = serde_json::from_str::<serde::de::IgnoredAny>(line);
+        let complete = parsed.is_ok();
+        let incomplete = !line.trim().is_empty() && parsed.is_err_and(|error| error.is_eof());
+        if complete || incomplete {
+            output.push_str(&rewrite_rooted_text(
+                &raw[text_start..offset],
+                source_root,
+                target_root,
+            ));
+            if complete {
+                output.push_str(&rewrite_root_reference_value(
+                    line,
+                    source_root,
+                    target_root,
+                )?);
+            } else {
+                output.push_str(line);
+            }
+            text_start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    output.push_str(&rewrite_rooted_text(
+        &raw[text_start..],
+        source_root,
+        target_root,
+    ));
+    Ok(output)
+}
+
+fn rewrite_root_reference_value(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_ok() {
+        // Preserve authored JSON bytes around the relocated strings, including
+        // whitespace and escapes. Decoding also handles Windows path separators.
+        let mut output = String::with_capacity(raw.len());
+        let mut cursor = 0;
+        let mut previous_key = None;
+        while let Some(offset) = raw[cursor..].find('"') {
+            let start = cursor + offset;
+            output.push_str(&raw[cursor..start]);
+            let end = json_value_end(raw, start)?;
+            let is_key = raw[end..].trim_start().starts_with(':');
+            let path_value = !is_key
+                && previous_key.take().is_some_and(|key: String| {
+                    matches!(
+                        key.as_str(),
+                        "path" | "source" | "cwd" | "workspace" | "package"
+                    ) || key.ends_with("Path")
+                        || key.ends_with("Dir")
+                        || key.ends_with("_path")
+                        || key.ends_with("_dir")
+                });
+            let Ok(value) = serde_json::from_str::<String>(&raw[start..end]) else {
+                if path_value || is_key {
+                    output.push_str(&raw[start..end]);
+                } else {
+                    output.push_str(&rewrite_opaque_json_string(
+                        &raw[start..end],
+                        source_root,
+                        target_root,
+                    )?);
+                }
+                cursor = end;
+                previous_key = None;
+                continue;
+            };
+            if is_key {
+                previous_key = Some(value.clone());
+            }
+            let replacement = if path_value
+                && (Path::new(&value).is_absolute()
+                    || value
+                        .get(..5)
+                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")))
+            {
+                // A JSON path is one filename; whitespace is not an argument
+                // separator, including escaped newlines within that filename.
+                rewrite_path_value(&value, source_root, target_root)
+            } else {
+                rewrite_root_reference_value(&value, source_root, target_root)?
+            };
+            if replacement != value {
+                output.push_str(
+                    &serde_json::to_string(&replacement).map_err(|error| error.to_string())?,
+                );
+            } else {
+                output.push_str(&raw[start..end]);
+            }
+            cursor = end;
+        }
+        output.push_str(&raw[cursor..]);
+        return Ok(output);
+    }
+    if raw.contains('\n')
+        && raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok())
+        && raw
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| {
+                line.trim_start().starts_with(['{', '[', '"'])
+                    && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+            })
+    {
+        // Nested content consists entirely of complete serialized values.
+        // Decode those values directly; file-level recovery framing stays above.
+        let mut output = String::with_capacity(raw.len());
+        for line in raw.split_inclusive('\n') {
+            output.push_str(&rewrite_root_reference_value(
+                line,
+                source_root,
+                target_root,
+            )?);
+        }
+        return Ok(output);
+    }
+    Ok(rewrite_rooted_text(raw, source_root, target_root))
+}
+
+fn rewrite_opaque_json_string(
+    raw: &str,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let utf16_escape = |at: usize| -> Option<u16> {
+        if bytes.get(at..at + 2)? != b"\\u" {
+            return None;
+        }
+        u16::from_str_radix(raw.get(at + 2..at + 6)?, 16).ok()
+    };
+    let mut opaque = Vec::new();
+    let mut scan = 1;
+    while scan < raw.len() - 1 {
+        if bytes[scan] == b'\\' {
+            if let Some(escaped) = utf16_escape(scan) {
+                if (0xd800..=0xdbff).contains(&escaped)
+                    && utf16_escape(scan + 6).is_some_and(|low| (0xdc00..=0xdfff).contains(&low))
+                {
+                    scan += 12;
+                    continue;
+                }
+                if (0xd800..=0xdfff).contains(&escaped) {
+                    opaque.push(scan..scan + 6);
+                }
+                scan += 6;
+            } else {
+                scan += 2;
+            }
+        } else {
+            scan += raw[scan..].chars().next().unwrap().len_utf8();
+        }
+    }
+    let mut output = String::from("\"");
+    let mut start = 1;
+    let count = opaque.len();
+    for (index, range) in opaque
+        .into_iter()
+        .chain([raw.len() - 1..raw.len() - 1])
+        .enumerate()
+    {
+        let encoded = &raw[start..range.start];
+        let decoded: String =
+            serde_json::from_str(&format!("\"{encoded}\"")).map_err(|error| error.to_string())?;
+        // Opaque UTF-16 escapes are not separators or valid path characters. Guards
+        // keep a reference from acquiring a false boundary at a split.
+        let guarded = format!(
+            "{}{}{}",
+            if start > 1 { "\0" } else { "" },
+            decoded,
+            if index < count { "\0" } else { "" }
+        );
+        let rewritten = rewrite_rooted_text(&guarded, source_root, target_root);
+        let rewritten =
+            &rewritten[usize::from(start > 1)..rewritten.len() - usize::from(index < count)];
+        if rewritten == decoded {
+            output.push_str(encoded);
+        } else {
+            let encoded = serde_json::to_string(rewritten).map_err(|error| error.to_string())?;
+            output.push_str(&encoded[1..encoded.len() - 1]);
+        }
+        output.push_str(&raw[range.clone()]);
+        start = range.end;
+    }
+    output.push('"');
+    Ok(output)
+}
+
+// Windows accepts both separators. Normalize only the comparison view so the
+// original path suffix and unrelated text retain their spelling.
+fn root_comparison(value: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(value.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
+fn rooted_path_suffix<'a>(path: &'a str, source_root: &str) -> Option<std::borrow::Cow<'a, str>> {
+    if path.contains('\0') {
+        return None;
+    }
+    let path_comparison = root_comparison(path);
+    let source_comparison = root_comparison(source_root);
+    path_comparison.strip_prefix(source_comparison.as_ref())?;
+    let suffix = &path[source_root.len()..];
+    if !suffix.is_empty() && !suffix.starts_with(std::path::is_separator) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for component in suffix.split(std::path::is_separator) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if let Some(parent) = depth.checked_sub(1) {
+                    depth = parent;
+                } else {
+                    let normalized = clean_path(Path::new(path));
+                    let root = clean_path(Path::new(source_root));
+                    let relative = normalized.strip_prefix(root).ok()?;
+                    return Some(std::borrow::Cow::Owned(
+                        if relative.as_os_str().is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}{}", std::path::MAIN_SEPARATOR, display_path(relative))
+                        },
+                    ));
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    Some(std::borrow::Cow::Borrowed(suffix))
+}
+
+fn relocate_rooted_path(path: &str, source_root: &str, target_root: &str) -> Option<String> {
+    let suffix = rooted_path_suffix(path, source_root)?;
+    Some(format!("{target_root}{suffix}"))
+}
+
+fn reference_boundary(ch: char) -> bool {
+    ch.is_whitespace() || "\"'`=([{,:;<>)]}|&".contains(ch)
+}
+
+fn file_url_starts(raw: &str) -> impl Iterator<Item = usize> + '_ {
+    raw.match_indices(':').filter_map(move |(colon, _)| {
+        let start = colon.checked_sub(4)?;
+        (raw.get(start..colon)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+            && raw[..start]
+                .chars()
+                .next_back()
+                .is_none_or(reference_boundary))
+        .then_some(start)
+    })
+}
+
+fn plain_root_references(
+    raw: &str,
+    source_root: &str,
+    quoted: &[std::ops::Range<usize>],
+    file_urls: &[usize],
+) -> Vec<usize> {
+    let comparison = root_comparison(raw);
+    let source = root_comparison(source_root);
+    let mut quote_index = 0;
+    comparison
+        .match_indices(source.as_ref())
+        .filter_map(|(start, _)| {
+            // In file:/absolute/path, the path belongs to its own URI scheme.
+            // It is not a second plain reference after a punctuation boundary.
+            if start
+                .checked_sub(5)
+                .is_some_and(|scheme| file_urls.binary_search(&scheme).is_ok())
+            {
+                return None;
+            }
+            let end = start + source_root.len();
+            while quoted
+                .get(quote_index)
+                .is_some_and(|range| range.end <= start)
+            {
+                quote_index += 1;
+            }
+            let enclosing = quoted
+                .get(quote_index)
+                .filter(|range| range.start <= start && range.end >= end);
+            let before = raw[..start]
+                .chars()
+                .next_back()
+                .is_none_or(reference_boundary);
+            let after = raw[end..]
+                .chars()
+                .next()
+                .is_none_or(std::path::is_separator)
+                || enclosing.is_some_and(|range| range.end == end)
+                || (enclosing.is_none() && raw[end..].starts_with(['\r', '\n']));
+            (before && after).then_some(start)
+        })
+        .collect()
+}
+
+fn rewrite_rooted_text(raw: &str, source_root: &str, target_root: &str) -> String {
+    // File URLs have their own escaping and authority rules. Preserve other URL
+    // components and never interpret an external URL as a local command path.
+    let quoted = quoted_value_ranges(raw);
+    let mut quote_index = 0;
+    let mut urls = Vec::new();
+    let mut edits = Vec::new();
+    let starts: Vec<_> = file_url_starts(raw).collect();
+    let plain = plain_root_references(raw, source_root, &quoted, &starts);
+    let mut boundaries = starts.clone();
+    boundaries.extend(plain.iter().copied());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    // A separated opaque escape ends the valid text span; an adjacent escape
+    // remains guarded so it cannot create a false root boundary.
+    let text_ends: Vec<_> = raw
+        .char_indices()
+        .filter(|(offset, delimiter)| {
+            delimiter.is_control()
+                && (*delimiter != '\0'
+                    || raw[..*offset]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+        })
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(raw.len()))
+        .collect();
+    let mut text_index = 0;
+    let angle_ends: Vec<_> = raw.match_indices('>').map(|(offset, _)| offset).collect();
+    for &start in &starts {
+        if urls
+            .last()
+            .is_some_and(|range: &std::ops::Range<usize>| start < range.end)
+        {
+            continue;
+        }
+        while quoted
+            .get(quote_index)
+            .is_some_and(|range| range.end <= start)
+        {
+            quote_index += 1;
+        }
+        let enclosing = quoted.get(quote_index).filter(|range| range.start <= start);
+        while text_ends[text_index] <= start {
+            text_index += 1;
+        }
+        let quote_end = enclosing
+            .map_or(raw.len(), |range| range.end)
+            .min(text_ends[text_index]);
+        let angle_end = raw[..start]
+            .ends_with('<')
+            .then(|| {
+                angle_ends
+                    .get(angle_ends.partition_point(|offset| *offset < start))
+                    .copied()
+            })
+            .flatten()
+            .filter(|offset| *offset < quote_end);
+        let enclosing_end = angle_end.unwrap_or(quote_end);
+        // Every recognized reference starts a new span, irrespective of its
+        // representation or separating punctuation. The same plain-path list
+        // drives replacement below, so discovery and rewriting cannot disagree.
+        let next = boundaries
+            .get(boundaries.partition_point(|offset| *offset <= start))
+            .copied()
+            .filter(|offset| *offset <= enclosing_end);
+        let mut value_end = next.unwrap_or(enclosing_end);
+        if let Some(next) = next {
+            if raw[..next].ends_with('<') {
+                value_end -= 1;
+            }
+            if let Some(space) = raw[start..next].find(char::is_whitespace) {
+                if let Some((offset, ch)) = raw[start + space..next]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, ch)| ch.is_whitespace())
+                {
+                    let word_start = start + space + offset + ch.len_utf8();
+                    let prefix = &raw[word_start..next];
+                    let label = prefix
+                        .strip_suffix('=')
+                        .or_else(|| prefix.strip_suffix(':'));
+                    if prefix.is_empty()
+                        || label.is_some_and(|label| {
+                            !label.is_empty()
+                                && label
+                                    .chars()
+                                    .all(|ch| ch.is_alphanumeric() || "_.-".contains(ch))
+                        })
+                    {
+                        value_end = word_start;
+                    }
+                }
+            }
+        }
+        // This selected span is the complete URI candidate. Never fall back
+        // to a whitespace-truncated prefix: ownership can change after spaces.
+        // URL syntax ignores trailing ASCII spacing. Preserve it outside the
+        // replacement so a bare-root URL gets the same boundary as a child URL.
+        value_end = start + raw[start..value_end].trim_end_matches([' ', '\t']).len();
+        let range = start..value_end;
+        if let Some(relocated) = rewrite_file_url(&raw[range.clone()], source_root, target_root) {
+            edits.push((range.clone(), relocated));
+        }
+        urls.push(range);
+    }
+    // Free-form text has no filesystem or command-language schema. Apply the
+    // root boundary rule literally, without interpreting arguments or '..'.
+    // Keep the original value intact while locating both URLs and plain paths.
+    let mut url_index = 0;
+    for start in plain {
+        let end = start + source_root.len();
+        while urls.get(url_index).is_some_and(|range| range.end <= start) {
+            url_index += 1;
+        }
+        if !urls.get(url_index).is_some_and(|range| range.start < end) {
+            edits.push((start..end, target_root.to_string()));
+        }
+    }
+    edits.sort_unstable_by_key(|(range, _)| range.start);
+    let mut output = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    for (range, replacement) in edits {
+        output.push_str(&raw[cursor..range.start]);
+        output.push_str(&replacement);
+        cursor = range.end;
+    }
+    output.push_str(&raw[cursor..]);
+    output
+}
+
+fn decoded_uri_byte(bytes: &[u8], offset: &mut usize) -> Option<u8> {
+    let byte = *bytes.get(*offset)?;
+    *offset += 1;
+    if byte == b'%' {
+        if let (Some(high), Some(low)) = (bytes.get(*offset), bytes.get(*offset + 1)) {
+            if let (Some(high), Some(low)) = (
+                char::from(*high).to_digit(16),
+                char::from(*low).to_digit(16),
+            ) {
+                *offset += 2;
+                return Some((high * 16 + low) as u8);
+            }
+        }
+    }
+    Some(byte)
+}
+
+fn uri_path_prefix_length(raw: &str, prefix: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut expected_offset = 0;
+    while let Some(expected) = decoded_uri_byte(prefix.as_bytes(), &mut expected_offset) {
+        let actual = decoded_uri_byte(raw.as_bytes(), &mut offset)?;
+        if actual != expected
+            && !(cfg!(windows)
+                && std::path::is_separator(char::from(actual))
+                && std::path::is_separator(char::from(expected)))
+        {
+            return None;
+        }
+    }
+    raw.is_char_boundary(offset).then_some(offset)
+}
+
+fn rewrite_file_url(value: &str, source_root: &str, target_root: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    let path = url.to_file_path().ok()?;
+    let source_url = url::Url::from_file_path(source_root).ok()?;
+    let canonical_source = source_url.to_file_path().ok()?;
+    let path = path.to_str()?;
+    let canonical_source = canonical_source.to_str()?;
+    let relocated = relocate_rooted_path(path, canonical_source, target_root)?;
+    // URL parsing establishes ownership; splice only the encoded root in the
+    // original representation so filenames, query data and surrounding text
+    // retain their bytes instead of being serialized again.
+    let after_scheme = value.get(5..)?;
+    let raw_path = if after_scheme.as_bytes().get(..2).is_some_and(|prefix| {
+        prefix
+            .iter()
+            .all(|byte| std::path::is_separator(char::from(*byte)))
+    }) {
+        let authority = &after_scheme[2..];
+        &authority[authority.find(std::path::is_separator)?..]
+    } else {
+        after_scheme
+    };
+    let source_path =
+        if !raw_path.starts_with(std::path::is_separator) && source_url.host_str().is_none() {
+            source_url.path().strip_prefix('/')?
+        } else {
+            source_url.path()
+        };
+    let prefix_length = uri_path_prefix_length(raw_path, source_path)?;
+    let suffix = &raw_path[prefix_length..];
+    if !suffix.is_empty() && !suffix.starts_with(['?', '#']) {
+        let mut offset = 0;
+        if !std::path::is_separator(char::from(decoded_uri_byte(
+            suffix.as_bytes(),
+            &mut offset,
+        )?)) {
+            return None;
+        }
+    }
+    let destination = url::Url::from_file_path(target_root).ok()?;
+    let candidate = format!("{destination}{suffix}");
+    if url::Url::parse(&candidate).ok()?.to_file_path().ok()? == Path::new(&relocated) {
+        return Some(candidate);
+    }
+    // A source path can leave and re-enter its root through dot segments. Its
+    // original suffix need not have the same meaning below a different root.
+    let destination = url::Url::from_file_path(&relocated).ok()?;
+    let trailer = value.find(['?', '#']).map_or("", |offset| &value[offset..]);
+    Some(format!("{destination}{trailer}"))
+}
+
+fn rewrite_path_value(value: &str, source_root: &str, target_root: &str) -> String {
+    relocate_rooted_path(value, source_root, target_root)
+        .or_else(|| rewrite_file_url(value, source_root, target_root))
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn json_value_end(raw: &str, start: usize) -> Result<usize, String> {
+    let mut values =
+        serde_json::Deserializer::from_str(&raw[start..]).into_iter::<serde::de::IgnoredAny>();
+    values
+        .next()
+        .ok_or("missing JSON value")?
+        .map_err(|error| error.to_string())?;
+    Ok(start + values.byte_offset())
+}
+
+#[derive(Clone, Copy)]
+enum PluginIndexJson {
+    Document,
+    Index,
+    Records,
+    Record,
+    Plugins,
+    Plugin,
+    Package,
+    Path,
+    Preserve,
+}
+
+impl PluginIndexJson {
+    fn field(self, key: Option<&str>) -> Self {
+        match (self, key) {
+            (Self::Document, Some("index")) => Self::Index,
+            (Self::Index, Some("installRecords")) => Self::Records,
+            (Self::Index, Some("plugins")) => Self::Plugins,
+            (Self::Index, Some("workspaceDir")) => Self::Path,
+            (Self::Records, _) => Self::Record,
+            (Self::Record, Some("installPath" | "sourcePath")) => Self::Path,
+            (Self::Plugin, Some("rootDir" | "source" | "setupSource" | "manifestPath")) => {
+                Self::Path
+            }
+            (Self::Plugin, Some("packageJson")) => Self::Package,
+            (Self::Package, Some("path")) => Self::Path,
+            _ => Self::Preserve,
+        }
+    }
+}
+
+fn rewrite_plugin_index_json(
+    raw: &str,
+    scope: PluginIndexJson,
+    source_root: &str,
+    target_root: &str,
+) -> Result<String, String> {
+    if matches!(scope, PluginIndexJson::Preserve) {
+        return Ok(raw.to_string());
+    }
+    if matches!(scope, PluginIndexJson::Path) {
+        let Ok(value) = serde_json::from_str::<String>(raw) else {
+            return Ok(raw.to_string());
+        };
+        let rewritten = rewrite_path_value(&value, source_root, target_root);
+        return if rewritten == value {
+            Ok(raw.to_string())
+        } else {
+            serde_json::to_string(&rewritten).map_err(|error| error.to_string())
+        };
+    }
+    // Walk known containers while retaining the original serialization of every
+    // other value. In particular, diagnostic prose is not a relocation surface.
+    let bytes = raw.as_bytes();
+    let skip_space = |mut offset: usize| {
+        while bytes.get(offset).is_some_and(u8::is_ascii_whitespace) {
+            offset += 1;
+        }
+        offset
+    };
+    let start = skip_space(0);
+    let object = bytes.get(start) == Some(&b'{');
+    if !object && !(matches!(scope, PluginIndexJson::Plugins) && bytes.get(start) == Some(&b'[')) {
+        return Ok(raw.to_string());
+    }
+    let mut scan = skip_space(start + 1);
+    let mut cursor = 0;
+    let mut output = String::with_capacity(raw.len());
+    while !matches!(bytes.get(scan), None | Some(b'}' | b']')) {
+        let child = if object {
+            let key_end = json_value_end(raw, scan)?;
+            let key = serde_json::from_str::<String>(&raw[scan..key_end]).ok();
+            let colon = skip_space(key_end);
+            if bytes.get(colon) != Some(&b':') {
+                return Err("missing JSON object separator".to_string());
+            }
+            scan = skip_space(colon + 1);
+            scope.field(key.as_deref())
+        } else {
+            PluginIndexJson::Plugin
+        };
+        let end = json_value_end(raw, scan)?;
+        output.push_str(&raw[cursor..scan]);
+        output.push_str(&rewrite_plugin_index_json(
+            &raw[scan..end],
+            child,
+            source_root,
+            target_root,
+        )?);
+        cursor = end;
+        scan = skip_space(end);
+        if bytes.get(scan) == Some(&b',') {
+            scan = skip_space(scan + 1);
+        }
+    }
+    output.push_str(&raw[cursor..]);
+    Ok(output)
+}
+
+fn closing_quote(raw: &str, start: usize, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, ch) in raw[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != '\'' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(start + offset);
+        }
+    }
+    None
+}
+
+fn quoted_value_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut scan = 0;
+    while let Some(offset) = raw[scan..].find(['"', '\'', '`']) {
+        let quote_at = scan + offset;
+        let quote = raw[quote_at..].chars().next().unwrap();
+        let start = quote_at + quote.len_utf8();
+        if raw[..quote_at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !reference_boundary(ch))
+        {
+            scan = start;
+            continue;
+        }
+        let end = closing_quote(raw, start, quote).unwrap_or(raw.len());
+        ranges.push(start..end);
+        scan = end + usize::from(end < raw.len());
+    }
+    ranges
+}
+
+fn with_owner_write_permission<T>(
+    path: &Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let mut writable = permissions.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        writable.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    writable.set_readonly(false);
+    if writable == permissions {
+        return action();
+    }
+    fs::set_permissions(path, writable).map_err(|error| error.to_string())?;
+    let result = action();
+    let restored = fs::set_permissions(path, permissions).map_err(|error| error.to_string());
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("failed to restore imported permissions: {error}")),
+        (Err(error), Err(restore)) => Err(format!(
+            "{error}; failed to restore imported permissions: {restore}"
+        )),
+    }
 }
 
 // Workshop drafts, support files, and rollback receipts share stored hashes.
@@ -455,6 +1252,7 @@ fn is_legacy_audit_generation(suffix: &str) -> bool {
 #[derive(Clone, Copy)]
 enum PluginPathRelocation<'a> {
     Imported,
+    Archived,
     Cloned {
         source: &'a EnvPaths,
         target: &'a EnvPaths,
@@ -477,6 +1275,7 @@ pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<()
     let Some(database_path) = contained_imported_database(
         &target.state_dir.join("state/openclaw.sqlite"),
         &target.root,
+        false,
     )?
     else {
         return Ok(());
@@ -507,22 +1306,73 @@ fn relocate_installed_plugin_index_paths(
     relocation: PluginPathRelocation<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
     let database_root = match relocation {
-        PluginPathRelocation::Imported => target_state_root,
+        PluginPathRelocation::Imported | PluginPathRelocation::Archived => target_state_root,
         PluginPathRelocation::Cloned { target, .. } => &target.root,
     };
-    let Some(database_path) = contained_imported_database(database_path, database_root)? else {
+    let Some(database_path) = contained_imported_database(
+        database_path,
+        database_root,
+        matches!(relocation, PluginPathRelocation::Archived),
+    )?
+    else {
         return Ok(MigratedRuntimeStateResult::default());
     };
     if !is_sqlite_database(&database_path)? {
         return Ok(MigratedRuntimeStateResult::default());
     }
 
+    let relocate = || {
+        relocate_plugin_records_in_database(
+            &database_path,
+            source_state_root,
+            target_state_root,
+            relocation,
+        )
+    };
+    if matches!(relocation, PluginPathRelocation::Archived) {
+        let parent = database_path
+            .parent()
+            .ok_or("imported database has no parent")?;
+        with_owner_write_permission(parent, || {
+            with_owner_write_permission(&database_path, relocate)
+        })
+    } else {
+        relocate()
+    }
+}
+
+fn relocate_plugin_records_in_database(
+    database_path: &Path,
+    source_state_root: &Path,
+    target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
+) -> Result<MigratedRuntimeStateResult, String> {
     let connection = Connection::open(&database_path).map_err(|error| {
         format!(
             "failed to open imported OpenClaw state database {}: {error}",
             display_path(&database_path)
         )
     })?;
+    if matches!(relocation, PluginPathRelocation::Archived) {
+        // Updating the receipt must not run stored callbacks or cascades that
+        // change other rows. Both settings are local to this connection.
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY,
+                false,
+            )
+            .map_err(|error| {
+                format!("failed to isolate imported plugin receipt update: {error}")
+            })?;
+        connection
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                false,
+            )
+            .map_err(|error| {
+                format!("failed to isolate imported plugin receipt update: {error}")
+            })?;
+    }
     let table_exists = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugin_index'",
@@ -555,19 +1405,112 @@ fn relocate_installed_plugin_index_paths(
         )
     };
 
-    let Some(raw_records) = connection
-        .query_row(select_sql, [], |row| row.get::<_, String>(0))
-        .optional()
+    let scope = if table_exists {
+        PluginIndexJson::Records
+    } else {
+        PluginIndexJson::Document
+    };
+    let mut queries = vec![(select_sql.to_string(), update_sql.to_string(), scope)];
+    if table_exists && matches!(relocation, PluginPathRelocation::Archived) {
+        // Older databases store the same index in separate columns. Some older
+        // snapshots contain only install_records_json, so inspect optional fields.
+        for (column, scope) in [
+            ("plugins_json", PluginIndexJson::Plugins),
+            ("workspace_dir", PluginIndexJson::Path),
+        ] {
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('installed_plugin_index') WHERE name = ?1)",
+                [column], |row| row.get::<_, bool>(0),
+            ).map_err(|error| error.to_string())?;
+            if exists {
+                queries.push((
+                    format!("SELECT {column} FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'"),
+                    format!("UPDATE installed_plugin_index SET {column} = ?1 WHERE index_key = 'installed-plugin-index'"),
+                    scope,
+                ));
+            }
+        }
+    }
+    let mut changed = false;
+    for (select_sql, update_sql, scope) in queries {
+        let raw_records = if matches!(relocation, PluginPathRelocation::Archived) {
+            connection
+                .query_row(&select_sql, [], |row| row.get::<_, Option<String>>(0))
+                .optional()
+                .map(|value| value.flatten())
+        } else {
+            connection
+                .query_row(&select_sql, [], |row| row.get::<_, String>(0))
+                .optional()
+        }
         .map_err(|error| {
             format!(
                 "failed to read imported OpenClaw plugin install records {}: {error}",
-                display_path(&database_path)
+                display_path(database_path)
             )
-        })?
-    else {
-        return Ok(MigratedRuntimeStateResult::default());
-    };
+        })?;
+        let Some(raw_records) = raw_records else {
+            continue;
+        };
+        let rewritten = if matches!(relocation, PluginPathRelocation::Archived) {
+            if !matches!(scope, PluginIndexJson::Path) {
+                serde_json::from_str::<serde::de::IgnoredAny>(&raw_records).map_err(|error| {
+                    format!(
+                        "failed to parse imported OpenClaw plugin index {}: {error}",
+                        display_path(database_path)
+                    )
+                })?;
+            }
+            let source_root = display_path(source_state_root);
+            let target_root = display_path(target_state_root);
+            let rewritten = if matches!(scope, PluginIndexJson::Path) {
+                rewrite_path_value(&raw_records, &source_root, &target_root)
+            } else {
+                rewrite_plugin_index_json(&raw_records, scope, &source_root, &target_root)?
+            };
+            (rewritten != raw_records).then_some(rewritten)
+        } else {
+            rewrite_plugin_install_records(
+                &raw_records,
+                database_path,
+                table_exists,
+                source_state_root,
+                target_state_root,
+                relocation,
+            )?
+        };
+        if let Some(rewritten) = rewritten {
+            // A stored REPLACE conflict policy must not delete another row.
+            let update_sql = if matches!(relocation, PluginPathRelocation::Archived) {
+                update_sql.replacen("UPDATE ", "UPDATE OR ABORT ", 1)
+            } else {
+                update_sql
+            };
+            connection
+                .execute(&update_sql, [rewritten])
+                .map_err(|error| {
+                    format!(
+                        "failed to relocate imported OpenClaw plugin install records {}: {error}",
+                        display_path(database_path)
+                    )
+                })?;
+            changed = true;
+        }
+    }
+    Ok(MigratedRuntimeStateResult {
+        changed,
+        ..Default::default()
+    })
+}
 
+fn rewrite_plugin_install_records(
+    raw_records: &str,
+    database_path: &Path,
+    table_exists: bool,
+    source_state_root: &Path,
+    target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
+) -> Result<Option<String>, String> {
     let mut document: Value = serde_json::from_str(&raw_records).map_err(|error| {
         format!(
             "failed to parse imported OpenClaw plugin install records {}: {error}",
@@ -635,25 +1578,11 @@ fn relocate_installed_plugin_index_paths(
                 .join(", ")
         ));
     }
-    if !changed {
-        return Ok(MigratedRuntimeStateResult {
-            changed: false,
-            external_plugin_ids: external_plugin_ids.into_iter().collect(),
-        });
+    if changed {
+        Ok(Some(document.to_string()))
+    } else {
+        Ok(None)
     }
-
-    connection
-        .execute(update_sql, [document.to_string()])
-        .map_err(|error| {
-            format!(
-                "failed to relocate imported OpenClaw plugin install records {}: {error}",
-                display_path(&database_path)
-            )
-        })?;
-    Ok(MigratedRuntimeStateResult {
-        changed: true,
-        external_plugin_ids: external_plugin_ids.into_iter().collect(),
-    })
 }
 
 fn relocate_cloned_plugin_record(
@@ -774,14 +1703,20 @@ fn contained_plugin_path(path: &Path, root: &Path) -> bool {
 fn contained_imported_database(
     database_path: &Path,
     target_state_root: &Path,
+    allow_contained_link: bool,
 ) -> Result<Option<PathBuf>, String> {
     let metadata = match fs::symlink_metadata(database_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    // Resolve only regular imported files so a preserved symlink cannot redirect a writable open.
-    if !metadata.is_file() {
+    // Archive copies may retain internal links. Always resolve and check their
+    // regular target inside the owned copy before opening SQLite for writing.
+    let regular = metadata.is_file()
+        || (allow_contained_link
+            && metadata.is_symlink()
+            && fs::metadata(database_path).is_ok_and(|target| target.is_file()));
+    if !regular {
         return Err(format!(
             "imported OpenClaw state database must be a regular file inside the imported state: {}",
             display_path(database_path)
@@ -1405,6 +2340,36 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
             last_used_at: None,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_url_relocation_changes_windows_authority() {
+        for (source, target, original, expected) in [
+            (
+                r"\\old\share\source",
+                r"C:\copy",
+                "file://old/share/source/plugin.js?q=1#part",
+                "file:///C:/copy/plugin.js?q=1#part",
+            ),
+            (
+                r"\\old\share\source",
+                r"\\new\share\copy",
+                "file://old/share/source/plugin.js",
+                "file://new/share/copy/plugin.js",
+            ),
+            (
+                r"C:\source",
+                r"\\new\share\copy",
+                "file:///C:/source/plugin.js",
+                "file://new/share/copy/plugin.js",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_file_url(original, source, target).as_deref(),
+                Some(expected)
+            );
         }
     }
 
