@@ -23,7 +23,8 @@ use crate::infra::process_identity::{
 };
 use crate::infra::shell::apply_external_supervision_hint;
 use crate::service::inspect::{
-    ManagedJobObservation, inspect_job, inspect_job_for_activation, observe_job_for_source_watch,
+    LaunchdJobStatus, ManagedJobObservation, inspect_job, inspect_job_for_activation,
+    inspect_job_for_recovery, observe_job_for_source_watch,
 };
 use crate::service::platform::{
     ManagedServiceDefinition, ManagedServiceEnablement, ServiceManagerKind,
@@ -264,6 +265,23 @@ impl SupervisorGatewayAdmission {
             process: current_process_identity()?,
             process_scope: process_scope_id()?,
         })
+    }
+    fn verify_process(&self, pid: u32) -> Result<(), String> {
+        if self.process_scope != process_scope_id()? {
+            return Err(
+                "the daemon runtime record belongs to another boot or process namespace"
+                    .to_string(),
+            );
+        }
+        let process = observe_process(pid)?
+            .ok_or_else(|| "the observed daemon process exited before admission".to_string())?;
+        if !process.running || process.identity != self.process {
+            return Err(
+                "the daemon runtime record does not identify the current managed process"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -562,13 +580,45 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
+        self.inspect_with_checked_daemon(false)
+    }
+
+    pub(crate) fn inspect_for_recovery(&self) -> Result<SupervisorInspection, String> {
+        self.inspect_with_checked_daemon(true)
+    }
+
+    fn inspect_with_checked_daemon(&self, checked: bool) -> Result<SupervisorInspection, String> {
         let state = self.build_state()?;
-        let daemon = self.daemon_status()?;
+        let daemon = if checked {
+            self.daemon_summary_with_inspector("status", inspect_job_for_recovery)?
+        } else {
+            self.daemon_status()?
+        };
         let runtime = if daemon.running {
             self.read_runtime_state()?
         } else {
             None
         };
+
+        if checked && daemon.running {
+            let runtime = runtime
+                .as_ref()
+                .ok_or("running supervisor has no runtime observation")?;
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != daemon.ocm_home {
+                return Err(
+                    "supervisor runtime observation does not belong to this store".to_string(),
+                );
+            }
+            runtime
+                .gateway_admission
+                .as_ref()
+                .ok_or("running supervisor has no process identity in its runtime observation")?
+                .verify_process(
+                    daemon
+                        .pid
+                        .ok_or("running supervisor has no observed process ID")?,
+                )?;
+        }
 
         Ok(SupervisorInspection {
             daemon,
@@ -994,6 +1044,20 @@ impl<'a> SupervisorService<'a> {
         action: &str,
         checked: bool,
     ) -> Result<SupervisorDaemonSummary, String> {
+        self.daemon_summary_with_inspector(action, |label, path, env| {
+            if checked {
+                inspect_job_for_activation(label, path, env)
+            } else {
+                Ok(inspect_job(label, path, env))
+            }
+        })
+    }
+
+    fn daemon_summary_with_inspector(
+        &self,
+        action: &str,
+        inspect: impl FnOnce(&str, &Path, &BTreeMap<String, String>) -> Result<LaunchdJobStatus, String>,
+    ) -> Result<SupervisorDaemonSummary, String> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let state_path = supervisor_state_path(self.env, self.cwd)?;
@@ -1001,11 +1065,7 @@ impl<'a> SupervisorService<'a> {
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
         let stdout_path = logs_dir.join("daemon.stdout.log");
         let stderr_path = logs_dir.join("daemon.stderr.log");
-        let status = if checked {
-            inspect_job_for_activation(&identity.label, &identity.definition_path, self.env)?
-        } else {
-            inspect_job(&identity.label, &identity.definition_path, self.env)
-        };
+        let status = inspect(&identity.label, &identity.definition_path, self.env)?;
         let enablement =
             if status.loaded && service_manager_kind(self.env) == ServiceManagerKind::Launchd {
                 managed_service_enablement(&identity.label, self.env)?
@@ -1181,20 +1241,7 @@ impl<'a> SupervisorService<'a> {
                     "the running daemon uses an unsupported Gateway admission version".to_string(),
                 );
             }
-            if capability.process_scope != process_scope_id()? {
-                return Err(
-                    "the daemon runtime record belongs to another boot or process namespace"
-                        .to_string(),
-                );
-            }
-            let process = observe_process(pid)?
-                .ok_or_else(|| "the observed daemon process exited before admission".to_string())?;
-            if !process.running || process.identity != capability.process {
-                return Err(
-                    "the daemon runtime record does not identify the current managed process"
-                        .to_string(),
-                );
-            }
+            capability.verify_process(pid)?;
             Ok(())
         })();
         result.map_err(|error| {
