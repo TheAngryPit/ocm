@@ -2830,59 +2830,79 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    fn fixture_root_spellings(root: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![root.to_path_buf(), fs::canonicalize(root).unwrap()];
+        if cfg!(windows) {
+            roots.push(PathBuf::from(
+                roots[1].to_str().unwrap().strip_prefix(r"\\?\").unwrap(),
+            ));
+            roots.push(PathBuf::from(format!(r"\\?\{}", root.display())));
+        }
+        roots
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
-    fn runtime_state_cleanup_rejects_internal_links_under_both_root_spellings() {
+    fn runtime_state_cleanup_rejects_internal_links_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         for copying in [false, true] {
-            for canonical in [false, true] {
+            for spelling in 0..if cfg!(windows) { 4 } else { 2 } {
                 let temp = tempfile::tempdir().unwrap();
                 let physical = fs::canonicalize(temp.path()).unwrap().join("physical");
                 let alias = temp.path().join("alias");
                 fs::create_dir_all(&physical).unwrap();
-                std::os::unix::fs::symlink(&physical, &alias).unwrap();
+                symlink_dir(&physical, &alias).unwrap();
                 let paths = derive_env_paths(alias.join("source"));
                 let owned = paths.state_dir.join("owned");
                 fs::create_dir_all(&owned).unwrap();
                 fs::write(owned.join("notes.txt"), "workspace").unwrap();
-                std::os::unix::fs::symlink(&owned, paths.state_dir.join("redirect")).unwrap();
-                let configured_root = if canonical {
-                    fs::canonicalize(&paths.root).unwrap()
-                } else {
-                    paths.root.clone()
-                };
-                let config = serde_json::json!({
-                    "agents": {"defaults": {"workspace": configured_root.join(".openclaw/redirect")}}
-                }).to_string();
-                fs::write(&paths.config_path, &config).unwrap();
-                fs::write(paths.state_dir.join("gateway.pid"), "123").unwrap();
-                let result = clear_runtime_state_with_policy(
-                    &paths,
-                    &BTreeMap::new(),
-                    OpenClawWorkspaceRuntime::default(),
-                    copying,
-                );
-                assert!(
-                    result
-                        .as_ref()
-                        .is_err_and(|error| error.contains("through a symlink")),
-                    "copying={copying}, canonical={canonical}: {result:?}; workspace_exists={}, pid_exists={}",
-                    owned.join("notes.txt").exists(),
-                    paths.state_dir.join("gateway.pid").exists(),
-                );
-                assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
-                assert_eq!(fs::read(owned.join("notes.txt")).unwrap(), b"workspace");
-                assert_eq!(
-                    fs::read(paths.state_dir.join("gateway.pid")).unwrap(),
-                    b"123"
-                );
-                assert!(paths.state_dir.join("redirect").is_symlink());
-                let error = resolve_archivable_workspaces(
-                    &paths,
-                    &BTreeMap::new(),
-                    OpenClawWorkspaceRuntime::default(),
-                )
-                .unwrap_err();
-                assert!(error.contains("through a symlink"), "{error}");
+                symlink_dir(&owned, paths.state_dir.join("redirect")).unwrap();
+                let configured_root = fixture_root_spellings(&paths.root).remove(spelling);
+                for agent_directory in [false, true] {
+                    let configured = configured_root.join(".openclaw").join("redirect");
+                    let agents = if agent_directory {
+                        serde_json::json!({"list": [{"id": "main", "agentDir": configured}]})
+                    } else {
+                        serde_json::json!({"defaults": {"workspace": configured}})
+                    };
+                    let config = serde_json::json!({"agents": agents}).to_string();
+                    fs::write(&paths.config_path, &config).unwrap();
+                    fs::write(paths.state_dir.join("gateway.pid"), "123").unwrap();
+                    let result = clear_runtime_state_with_policy(
+                        &paths,
+                        &BTreeMap::new(),
+                        OpenClawWorkspaceRuntime::default(),
+                        copying,
+                    );
+                    assert!(
+                        result
+                            .as_ref()
+                            .is_err_and(|error| error.contains("through a symlink")),
+                        "copying={copying}, spelling={spelling}, agent_directory={agent_directory}: {result:?}; workspace_exists={}, pid_exists={}",
+                        owned.join("notes.txt").exists(),
+                        paths.state_dir.join("gateway.pid").exists(),
+                    );
+                    assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
+                    assert_eq!(fs::read(owned.join("notes.txt")).unwrap(), b"workspace");
+                    assert_eq!(
+                        fs::read(paths.state_dir.join("gateway.pid")).unwrap(),
+                        b"123"
+                    );
+                    assert!(paths.state_dir.join("redirect").is_symlink());
+                    if !agent_directory {
+                        let error = resolve_archivable_workspaces(
+                            &paths,
+                            &BTreeMap::new(),
+                            OpenClawWorkspaceRuntime::default(),
+                        )
+                        .unwrap_err();
+                        assert!(error.contains("through a symlink"), "{error}");
+                    }
+                }
             }
         }
     }
@@ -3019,16 +3039,20 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn runtime_cleanup_preserves_agent_retention_policy_under_root_aliases() {
+    fn runtime_cleanup_preserves_agent_retention_policy_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         for copying in [false, true] {
-            for canonical in [false, true] {
+            for spelling in 0..if cfg!(windows) { 4 } else { 2 } {
                 let temp = tempfile::tempdir().unwrap();
                 let physical = temp.path().join("physical");
                 let alias = temp.path().join("alias");
                 fs::create_dir_all(&physical).unwrap();
-                std::os::unix::fs::symlink(&physical, &alias).unwrap();
+                symlink_dir(&physical, &alias).unwrap();
                 let paths = derive_env_paths(alias.join("source"));
                 let relative = "extensions/demo/node_modules/private-agent";
                 let agent = paths.state_dir.join(relative);
@@ -3048,11 +3072,7 @@ mod tests {
                     "{}",
                 )
                 .unwrap();
-                let configured = if canonical {
-                    fs::canonicalize(&agent).unwrap()
-                } else {
-                    agent.clone()
-                };
+                let configured = fixture_root_spellings(&agent).remove(spelling);
                 let config = serde_json::json!({"agents": {"list": [{"id": "main", "agentDir": configured}]}}).to_string();
                 fs::write(&paths.config_path, &config).unwrap();
                 assert!(
@@ -3085,10 +3105,19 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
-    fn runtime_state_cleanup_rejects_agent_session_collision_before_removing_entries() {
+    fn runtime_state_cleanup_rejects_agent_session_collision_under_root_spellings() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir;
         let temp = tempfile::tempdir().unwrap();
-        let paths = derive_env_paths(temp.path().join("target"));
+        let physical = temp.path().join("physical");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(&physical).unwrap();
+        symlink_dir(&physical, &alias).unwrap();
+        let paths = derive_env_paths(alias.join("target"));
         let sessions = paths.state_dir.join("agents/main/sessions");
         fs::create_dir_all(&sessions).unwrap();
         let payloads = [
@@ -3112,7 +3141,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, contents).unwrap();
         }
-        for directory in [sessions.clone(), fs::canonicalize(&sessions).unwrap()] {
+        for directory in fixture_root_spellings(&sessions) {
             let config = serde_json::json!({"agents":{"entries":{"main":{"agentDir":directory}}}})
                 .to_string();
             fs::write(&paths.config_path, &config).unwrap();
