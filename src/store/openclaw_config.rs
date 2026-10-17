@@ -5,8 +5,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 use serde_json::json;
+use serde_json::{Map, Value};
 use url::{Host, Url};
 
 use crate::env::EnvMeta;
@@ -385,11 +385,103 @@ pub(crate) fn rewrite_openclaw_config_includes_for_target(
     Ok(changed)
 }
 
+pub(crate) fn rewrite_included_agent_directories_for_target(
+    config_path: &Path,
+    source_paths: &OpenClawWorkspaceInventory,
+    source_root: &Path,
+    target_root: &Path,
+) -> Result<bool, String> {
+    let replacements = source_paths
+        .agent_directory_templates()
+        .iter()
+        .filter(|(template, _)| workspace_uses_changing_runtime_identity(template))
+        .map(|(template, path)| {
+            let relative = path
+                .strip_prefix(source_root)
+                .map_err(|error| error.to_string())?;
+            Ok((
+                template.clone(),
+                display_path(&clean_path(&target_root.join(relative))),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+    let Some(effective) = load_effective_openclaw_config(config_path)? else {
+        return Ok(false);
+    };
+    let mut scopes = effective.include_scopes;
+    scopes.insert(config_path.to_path_buf(), BTreeSet::from([Vec::new()]));
+    let mut changed = false;
+    for (path, scopes) in scopes {
+        let Some(value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut rewritten = None;
+        for mut scope in scopes {
+            let mut candidate = value.clone();
+            rewrite_agent_directory_templates(&mut candidate, &mut scope, &replacements);
+            if rewritten
+                .as_ref()
+                .is_some_and(|previous| previous != &candidate)
+            {
+                return Err(format!(
+                    "cannot safely rewrite identity-bound agent directory in shared OpenClaw include {}; separate agent and non-agent include consumers before simulation",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some(candidate);
+        }
+        if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            write_config_value(&path, &rewritten)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn rewrite_agent_directory_templates(
+    value: &mut Value,
+    scope: &mut Vec<String>,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    if scope.len() == 4
+        && scope[0] == "agents"
+        && matches!(scope[1].as_str(), "entries" | "list")
+        && scope[3] == "agentDir"
+        && let Some(replacement) = value.as_str().and_then(|raw| replacements.get(raw))
+    {
+        *value = Value::String(replacement.clone());
+        return true;
+    }
+    let mut changed = false;
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                scope.push(key.clone());
+                changed |= rewrite_agent_directory_templates(child, scope, replacements);
+                scope.pop();
+            }
+        }
+        Value::Array(array) => {
+            for (index, child) in array.iter_mut().enumerate() {
+                scope.push(index.to_string());
+                changed |= rewrite_agent_directory_templates(child, scope, replacements);
+                scope.pop();
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
 pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
     config_path: &Path,
     source_workspaces: &OpenClawWorkspaceInventory,
     source_root: &Path,
     target_root: &Path,
+    source_agent_root: &Path,
 ) -> Result<bool, String> {
     let Some(mut value) = read_config_value(config_path)? else {
         return Ok(false);
@@ -425,6 +517,13 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             let Some(entry) = entry.as_object_mut() else {
                 continue;
             };
+            changed |= rewrite_identity_bound_agent_directory(
+                entry,
+                source_workspaces.agent_directory(agent_id),
+                source_root,
+                source_agent_root,
+                target_root,
+            )?;
             let identity_bound = entry
                 .get("workspace")
                 .and_then(Value::as_str)
@@ -450,9 +549,16 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             let Some(entry) = entry.as_object_mut() else {
                 continue;
             };
-            let Some(agent_id) = entry.get("id").and_then(Value::as_str) else {
+            let Some(agent_id) = entry.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
+            changed |= rewrite_identity_bound_agent_directory(
+                entry,
+                source_workspaces.agent_directory(&agent_id),
+                source_root,
+                source_agent_root,
+                target_root,
+            )?;
             let identity_bound = entry
                 .get("workspace")
                 .and_then(Value::as_str)
@@ -460,7 +566,7 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
             if !identity_bound {
                 continue;
             }
-            let Some(source_workspace) = source_workspaces.agent_workspace(agent_id) else {
+            let Some(source_workspace) = source_workspaces.agent_workspace(&agent_id) else {
                 continue;
             };
             let target_workspace =
@@ -477,6 +583,33 @@ pub(crate) fn rewrite_identity_bound_workspace_paths_for_target(
         write_config_value(config_path, &value)?;
     }
     Ok(changed)
+}
+
+fn rewrite_identity_bound_agent_directory(
+    entry: &mut Map<String, Value>,
+    source_directory: Option<&Path>,
+    source_root: &Path,
+    source_agent_root: &Path,
+    target_root: &Path,
+) -> Result<bool, String> {
+    if !entry
+        .get("agentDir")
+        .and_then(Value::as_str)
+        .is_some_and(workspace_uses_changing_runtime_identity)
+    {
+        return Ok(false);
+    }
+    let Some(source_directory) = source_directory else {
+        return Ok(false);
+    };
+    let relative = source_directory.strip_prefix(source_root).or_else(|_| source_directory.strip_prefix(source_agent_root)).map_err(|_| {
+        format!("cannot rewrite identity-bound OpenClaw agent directory outside the source environment root: {}", display_path(source_directory))
+    })?;
+    entry.insert(
+        "agentDir".to_string(),
+        Value::String(display_path(&clean_path(&target_root.join(relative)))),
+    );
+    Ok(true)
 }
 
 fn rebase_workspace_path(
