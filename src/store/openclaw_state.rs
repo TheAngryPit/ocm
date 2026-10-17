@@ -13,7 +13,8 @@ use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_workspaces::{
-    OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime, canonicalize_path_allow_missing,
+    OpenClawCleanupPathError, OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime,
+    canonicalize_path_allow_missing, resolve_env_openclaw_cleanup_paths,
     resolve_env_openclaw_copy_paths, resolve_env_openclaw_workspaces,
 };
 
@@ -21,6 +22,7 @@ use super::openclaw_workspaces::{
 pub(crate) struct OpenClawStateAudit {
     pub issues: Vec<String>,
     pub repair_runtime_state: bool,
+    pub cleanup_error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -39,17 +41,24 @@ pub(crate) fn audit_openclaw_state(
         return OpenClawStateAudit {
             issues: Vec::new(),
             repair_runtime_state: false,
+            cleanup_error: None,
         };
     }
     let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
-    let workspaces = match resolve_archivable_workspaces(&paths, env, runtime) {
+    let workspaces = match resolve_env_openclaw_cleanup_paths(&paths, env, runtime) {
         Ok(workspaces) => workspaces,
         Err(error) => {
+            let cleanup_error = match &error {
+                OpenClawCleanupPathError::AgentSessionCollision(message) => Some(message.clone()),
+                OpenClawCleanupPathError::Inventory(_) => None,
+            };
             return OpenClawStateAudit {
                 issues: vec![format!(
-                    "OpenClaw workspace inventory could not be resolved safely: {error}"
+                    "OpenClaw workspace inventory could not be resolved safely: {}",
+                    error.into_message()
                 )],
                 repair_runtime_state: false,
+                cleanup_error,
             };
         }
     };
@@ -95,6 +104,7 @@ pub(crate) fn audit_openclaw_state(
     OpenClawStateAudit {
         repair_runtime_state: !issues.is_empty(),
         issues,
+        cleanup_error: None,
     }
 }
 
@@ -746,13 +756,14 @@ fn clear_runtime_state_with_policy(
     if !path_exists(&paths.state_dir) {
         return Ok(false);
     }
-    let resolve_paths = if copying {
-        resolve_env_openclaw_copy_paths
+    let workspaces = if copying {
+        let inventory = resolve_env_openclaw_copy_paths(paths, env, runtime)?;
+        inventory.archive_relative_roots(&paths.root)?;
+        inventory
     } else {
-        resolve_env_openclaw_workspaces
+        resolve_env_openclaw_cleanup_paths(paths, env, runtime)
+            .map_err(OpenClawCleanupPathError::into_message)?
     };
-    let workspaces = resolve_paths(paths, env, runtime)?;
-    workspaces.archive_relative_roots(&paths.root)?;
 
     let mut changed = false;
     for relative_path in runtime_debris_outside_agent_directories(
@@ -3053,14 +3064,10 @@ mod tests {
                     )
                     .unwrap()
                 );
-                if copying {
-                    assert_eq!(
-                        fs::read(agent.join("auth-profiles.json")).unwrap(),
-                        b"auth fixture"
-                    );
-                } else {
-                    assert!(!agent.exists());
-                }
+                assert_eq!(
+                    fs::read(agent.join("auth-profiles.json")).unwrap(),
+                    b"auth fixture"
+                );
                 assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
                 assert!(
                     !paths
@@ -3074,6 +3081,54 @@ mod tests {
                         .join("extensions/demo/.openclaw-runtime-deps.json")
                         .exists()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_state_cleanup_rejects_agent_session_collision_before_removing_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = derive_env_paths(temp.path().join("target"));
+        let sessions = paths.state_dir.join("agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let payloads = [
+            (sessions.join("auth-profiles.json"), "auth fixture"),
+            (sessions.join("stale.jsonl"), "stale session"),
+            (paths.state_dir.join("gateway.pid"), "123"),
+            (
+                paths
+                    .state_dir
+                    .join("extensions/demo/.openclaw-runtime-deps.json"),
+                "{}",
+            ),
+            (
+                paths
+                    .state_dir
+                    .join("extensions/demo/node_modules/index.js"),
+                "generated",
+            ),
+        ];
+        for (path, contents) in &payloads {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        for directory in [sessions.clone(), fs::canonicalize(&sessions).unwrap()] {
+            let config = serde_json::json!({"agents":{"entries":{"main":{"agentDir":directory}}}})
+                .to_string();
+            fs::write(&paths.config_path, &config).unwrap();
+            let error = clear_nonportable_runtime_state(
+                &paths,
+                &BTreeMap::new(),
+                OpenClawWorkspaceRuntime::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("configured agent directory overlaps canonical session storage"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&paths.config_path).unwrap(), config.as_bytes());
+            for (path, contents) in &payloads {
+                assert_eq!(fs::read(path).unwrap(), contents.as_bytes());
             }
         }
     }
