@@ -10,7 +10,7 @@ use crate::env::{
     ImportEnvironmentResult,
 };
 use crate::infra::archive::{
-    ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_with_options,
+    ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_from_resolved_root,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
 use serde::{Deserialize, Serialize};
@@ -1100,6 +1100,13 @@ pub fn export_environment(
         ));
     }
 
+    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
+    let archive_options = if options.include_state {
+        openclaw_env_state_archive_options(&env_paths)?
+    } else {
+        openclaw_env_archive_options(&env_paths, env, runtime)?
+    };
+    let canonical_root = fs::canonicalize(&env_paths.root).map_err(|error| error.to_string())?;
     let metadata = EnvArchiveMetadata {
         include_state: options.include_state,
         kind: "ocm-env-archive".to_string(),
@@ -1108,6 +1115,7 @@ pub fn export_environment(
         env: ArchivedEnvMeta {
             name: meta.name.clone(),
             source_root: Some(meta.root.clone()),
+            canonical_source_root: Some(display_path(&canonical_root)),
             gateway_port: meta.gateway_port,
             gateway_port_auto_assigned: meta.gateway_port_auto_assigned,
             service_enabled: meta.service_enabled,
@@ -1121,14 +1129,12 @@ pub fn export_environment(
         },
     };
 
-    let runtime = OpenClawWorkspaceRuntime::for_env(&meta.name, meta.gateway_port);
-    let archive_options = if options.include_state {
-        openclaw_env_state_archive_options(&env_paths)?
-    } else {
-        openclaw_env_archive_options(&env_paths, env, runtime)?
-    };
-    let result =
-        write_env_archive_with_options(&metadata, &env_paths.root, &output_path, archive_options);
+    let result = write_env_archive_from_resolved_root(
+        &metadata,
+        &canonical_root,
+        &output_path,
+        archive_options,
+    );
     if result.is_err() && !options.include_state {
         let _ = fs::remove_file(&output_path);
     }
@@ -1143,6 +1149,40 @@ pub fn export_environment(
         default_launcher: meta.default_launcher,
         protected: meta.protected,
     })
+}
+
+// These are identities recorded on the exporting host, not paths to open on
+// this host. In particular, POSIX import must accept Windows drive/UNC roots.
+fn archive_source_root_is_absolute(root: &Path) -> bool {
+    let Some(root) = root.to_str().filter(|root| !root.contains('\0')) else {
+        return false;
+    };
+    let bytes = root.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let unc = root.strip_prefix(r"\\").is_some_and(|rest| {
+        let mut parts = rest.split(['/', '\\']);
+        parts.next().is_some_and(|part| !part.is_empty())
+            && parts.next().is_some_and(|part| !part.is_empty())
+    });
+    root.starts_with('/') || drive || unc
+}
+
+#[cfg(windows)]
+fn ordinary_windows_archive_root(root: &Path) -> Option<PathBuf> {
+    let root = root.to_str()?;
+    if let Some(unc) = root.strip_prefix(r"\\?\UNC\") {
+        return Some(PathBuf::from(format!(r"\\{unc}")));
+    }
+    let drive = root.strip_prefix(r"\\?\")?;
+    let bytes = drive.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+    .then(|| PathBuf::from(drive))
 }
 
 pub fn import_environment(
@@ -1189,6 +1229,49 @@ pub(crate) fn import_environment_with_sandbox_origin(
             )?;
         }
 
+        let mut source_roots: Vec<&Path> = extracted
+            .metadata
+            .env
+            .source_root
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .collect();
+        if let Some(canonical) = extracted.metadata.env.canonical_source_root.as_deref() {
+            let canonical = Path::new(canonical);
+            if source_roots
+                .first()
+                .is_none_or(|root| !archive_source_root_is_absolute(root))
+                || !archive_source_root_is_absolute(canonical)
+                || canonical
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(
+                    "archive canonical source root must be absolute and accompany an absolute sourceRoot"
+                        .to_string(),
+                );
+            }
+            source_roots.push(canonical);
+        }
+        // Rust records extended-length Windows paths, while Node realpath
+        // returns ordinary drive/UNC spelling. Both denote the captured root.
+        // Only new identity-bearing archives gain these equivalent spellings;
+        // legacy archives keep their existing relocation behavior.
+        #[cfg(windows)]
+        let ordinary_roots: Vec<_> = if extracted.metadata.env.canonical_source_root.is_some() {
+            source_roots
+                .iter()
+                .filter_map(|root| ordinary_windows_archive_root(root))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(windows)]
+        source_roots.extend(ordinary_roots.iter().map(PathBuf::as_path));
+        // Match each original reference once, preferring its most specific root.
+        source_roots.sort_by_key(|root| std::cmp::Reverse(root.as_os_str().len()));
+        source_roots.dedup();
         let source_name = extracted.metadata.env.name.clone();
         let name = if let Some(name) = options.name.as_deref() {
             validate_name(name, "Environment name")?
@@ -1284,9 +1367,15 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 validate_nonportable_runtime_state_paths(&target_paths)?;
             }
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-            let config_rewrite = rewrite_openclaw_config_for_new_environment(
+            let config_rewrite = super::openclaw_config::rewrite_archived_openclaw_config(
                 &target_paths,
-                extracted.metadata.env.source_root.as_deref().map(Path::new),
+                &source_roots,
+                extracted
+                    .metadata
+                    .env
+                    .canonical_source_root
+                    .as_deref()
+                    .map(Path::new),
                 Some(gateway_port),
                 sandbox_origin.as_deref(),
             )?;
@@ -1317,17 +1406,13 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     .map(Path::new)
                     .unwrap_or(&extracted.root_dir),
             )?;
-            let state_rewrite = if extracted.metadata.include_state {
-                if let Some(source_root) = extracted.metadata.env.source_root.as_deref() {
-                    super::openclaw_state::relocate_archived_runtime_state(
-                        &target_paths,
-                        Path::new(source_root),
-                        env,
-                        target_runtime,
-                    )?
-                } else {
-                    Default::default()
-                }
+            let state_rewrite = if extracted.metadata.include_state && !source_roots.is_empty() {
+                super::openclaw_state::relocate_archived_runtime_state(
+                    &target_paths,
+                    &source_roots,
+                    env,
+                    target_runtime,
+                )?
             } else {
                 Default::default()
             };
