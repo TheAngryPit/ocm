@@ -70,6 +70,20 @@ impl<'a> ServiceService<'a> {
         self.stop_locked(name)
     }
 
+    pub(crate) fn recover_ownership(
+        &self,
+        name: &str,
+        expected_claim: Option<&str>,
+    ) -> Result<crate::supervisor::ServiceRecoverySummary, String> {
+        let _operation = if expected_claim.is_some() {
+            Some(crate::env::EnvironmentService::new(self.env, self.cwd).lock_operation(name)?)
+        } else {
+            None
+        };
+        crate::supervisor::SupervisorService::new(self.env, self.cwd)
+            .recover_ownership(name, expected_claim)
+    }
+
     pub(crate) fn stop_locked(&self, name: &str) -> Result<ServiceActionSummary, String> {
         manage::stop_service(name, self.env, self.cwd)
     }
@@ -194,6 +208,8 @@ impl<'a> ServiceService<'a> {
         &self,
         name: &str,
     ) -> Result<Option<ServiceMaintenanceState>, String> {
+        crate::supervisor::SupervisorService::new(self.env, self.cwd)
+            .ensure_retained_ownership_recovered(name)?;
         let status = self.status(name)?;
         let meta = crate::env::EnvironmentService::new(self.env, self.cwd).get(name)?;
         let state = ServiceMaintenanceState {
@@ -201,6 +217,11 @@ impl<'a> ServiceService<'a> {
             running: meta.service_running,
         };
         if !state.running && !status.running {
+            // A replacement may publish retained metadata during status().
+            // Require the canonical target rows to be retired, including a
+            // predecessor row that has not been marked retained yet.
+            crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                .ensure_background_gateway_quiescent(name, "snapshot access")?;
             return Ok(None);
         }
         preserve_operation_owner_before_managed_gateway_stop(
@@ -212,7 +233,13 @@ impl<'a> ServiceService<'a> {
         if state.running {
             self.stop_locked(name)?;
         }
-        if let Err(error) = self.wait_for_runtime_mutation_quiescence_locked(name) {
+        let quiescence = self
+            .wait_for_runtime_mutation_quiescence_locked(name)
+            .and_then(|()| {
+                crate::supervisor::SupervisorService::new(self.env, self.cwd)
+                    .ensure_background_gateway_quiescent(name, "snapshot access")
+            });
+        if let Err(error) = quiescence {
             return match self.restore_after_snapshot_locked(name, Some(state)) {
                 Ok(()) => Err(error),
                 Err(restore_error) => Err(format!(

@@ -40,6 +40,7 @@ fn write_running_snapshot_service(
     let stdout_path = path_string(&root.child("source.stdout.log"));
     let stderr_path = path_string(&root.child("source.stderr.log"));
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: env.get("OCM_HOME").unwrap().clone(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -78,6 +79,7 @@ fn write_running_snapshot_service(
 
 fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
     let runtime = SupervisorRuntimeState {
+        retained_ownership: None,
         kind: "ocm-supervisor-runtime".to_string(),
         ocm_home: ocm_home.to_string(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -3238,4 +3240,157 @@ fn env_snapshot_prune_json_supports_the_global_view() {
     assert!(output.contains("\"count\": 2"));
     assert!(output.contains("\"envName\": \"alpha\""));
     assert!(output.contains("\"envName\": \"beta\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshots_refuse_retained_target_ownership_until_exact_recovery() {
+    let root = TestDir::new("snapshot-retained-ownership");
+    let cwd = root.path();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(&root, &mut env);
+    for name in ["source", "sibling"] {
+        let output = run_ocm(cwd, &env, &["env", "create", name]);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let marker = root.child("ocm-home/envs/source/.openclaw/workspace/marker");
+    write_text(&marker, "snapshot");
+    let saved = run_ocm(
+        cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(saved.status.success(), "{}", stderr(&saved));
+    let saved: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    let id = saved["id"].as_str().unwrap();
+    write_text(&marker, "current");
+    let publisher = support::enable_fake_daemon_gateway_admission(&root, &mut env);
+    ocm::supervisor::SupervisorService::new(&env, cwd)
+        .install_daemon()
+        .unwrap();
+    let definition = support::managed_service_definition_path(&env, cwd, "source");
+    fs::remove_file(root.child("launchctl-print.txt")).unwrap();
+    let mut original = serde_json::to_value(&publisher).unwrap();
+    original["process"]["startedAt"] = "previous-generation".into();
+    let path = supervisor_runtime_path(&env, cwd).unwrap();
+    let mut runtime: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    runtime["services"] = serde_json::json!([{
+        "envName":"source", "bindingKind":"launcher", "bindingName":"stable",
+        "gatewayState":"pending", "restartHandoff":"protocol-v1", "restartCount":0,
+        "childPort":18789, "pid":null, "stdoutPath":"out", "stderrPath":"err"
+    }]);
+    runtime["retainedOwnership"] = serde_json::json!([{
+        "envName":"source", "claimId":"retained-target", "publisher":original
+    }]);
+    write_json_replacing_path(&path, &runtime);
+    let bytes = fs::read(&path).unwrap();
+    let registry = fs::read(env_registry_path(&env, cwd).unwrap()).unwrap();
+    for native in ["absent", "stopped", "running"] {
+        let print = root.child("launchctl-print.txt");
+        if native != "absent" {
+            let pid = if native == "running" {
+                format!("pid = {}\n", std::process::id())
+            } else {
+                String::new()
+            };
+            write_text(
+                &print,
+                &format!(
+                    "state = {native}\n{pid}path = {}\n",
+                    path_string(&definition)
+                ),
+            );
+        }
+        for args in [
+            vec!["env", "snapshot", "create", "source"],
+            vec!["env", "snapshot", "restore", "source", id],
+            vec!["service", "restart", "source"],
+        ] {
+            let output = run_ocm(cwd, &env, &args);
+            assert!(!output.status.success(), "{native}: {args:?}");
+            assert!(
+                stderr(&output).contains("retained service ownership"),
+                "{}",
+                stderr(&output)
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&marker).unwrap(), b"current");
+            assert_eq!(
+                fs::read(env_registry_path(&env, cwd).unwrap()).unwrap(),
+                registry
+            );
+        }
+        let sibling = run_ocm(cwd, &env, &["env", "snapshot", "create", "sibling"]);
+        assert!(sibling.status.success(), "{}", stderr(&sibling));
+        if print.exists() {
+            fs::remove_file(print).unwrap();
+        }
+    }
+    // Replacement publication can occur after entry validation, inside the
+    // native observation made by status(). It must not reopen the stopped path.
+    let manager = root.child("fake-bin/launchctl");
+    let manager_before = fs::read_to_string(&manager).unwrap();
+    let next_path = root.child("retained.next");
+    let observed = root.child("replacement-observed");
+    write_executable_script(
+        &manager,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = print ] && [ -f '{}' ]; then /bin/mv '{}' '{}'; printf observed > '{}'; fi\n{}",
+            path_string(&next_path),
+            path_string(&next_path),
+            path_string(&path),
+            path_string(&observed),
+            manager_before,
+        ),
+    );
+    for args in [
+        vec!["env", "snapshot", "create", "source"],
+        vec!["env", "snapshot", "restore", "source", id],
+    ] {
+        let mut predecessor = runtime.clone();
+        predecessor["retainedOwnership"] = serde_json::json!([]);
+        write_json_replacing_path(&path, &predecessor);
+        write_json_replacing_path(&next_path, &runtime);
+        let output = run_ocm(cwd, &env, &args);
+        assert!(
+            observed.exists(),
+            "native observation did not publish the replacement claim"
+        );
+        assert!(
+            !output.status.success(),
+            "snapshot used an observation from before retained publication"
+        );
+        assert!(
+            stderr(&output).contains("retained service ownership"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"current");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_file(&observed).unwrap();
+    }
+    write_executable_script(&manager, &manager_before);
+    // Offline publication identity must itself be demonstrably no longer live.
+    runtime["gatewayAdmission"] = original;
+    write_json_replacing_path(&path, &runtime);
+    let inspect = run_ocm(cwd, &env, &["service", "recover", "source", "--json"]);
+    assert!(inspect.status.success(), "{}", stderr(&inspect));
+    let inspect: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let recovered = run_ocm(
+        cwd,
+        &env,
+        &[
+            "service",
+            "recover",
+            "source",
+            "--acknowledge-stopped-processes",
+            "--if-claim",
+            inspect["claimToken"].as_str().unwrap(),
+        ],
+    );
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    let restored = run_ocm(cwd, &env, &["env", "snapshot", "restore", "source", id]);
+    assert!(restored.status.success(), "{}", stderr(&restored));
+    assert_eq!(fs::read(&marker).unwrap(), b"snapshot");
 }
