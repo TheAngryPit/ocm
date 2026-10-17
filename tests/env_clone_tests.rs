@@ -5,6 +5,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
 
@@ -48,7 +49,7 @@ fn read_plugin_registry(path: &Path, folded: bool) -> Value {
 }
 
 #[test]
-fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
+fn env_clone_rebases_session_paths_and_drops_database_owners() {
     let root = TestDir::new("clone-database-owners");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -77,6 +78,117 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
         "INSERT INTO agent_database_leases VALUES ('live', 'fixture', '/source/agent.sqlite', ?1, NULL, 1)",
         [std::process::id()],
     ).unwrap();
+    let source_root = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+    let target_root = root.child("ocm-home/envs/target");
+    connection
+        .execute_batch(
+            "CREATE TABLE agent_databases (agent_id TEXT PRIMARY KEY, path TEXT NOT NULL);",
+        )
+        .unwrap();
+    let databases = [
+        ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+        ".openclaw/private-agent/agent.sqlite",
+    ];
+    write_text(
+        &source_root.join(".openclaw/openclaw.json"),
+        &serde_json::json!({"agents":{"entries":{"main":{"agentDir":
+            root.child("ocm-home/envs/source/.openclaw/private-agent")
+        }}}})
+        .to_string(),
+    );
+    let mut source_databases = Vec::new();
+    for (id, relative) in databases.iter().enumerate() {
+        let path = source_root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT NOT NULL);
+             CREATE TABLE preserved (value TEXT NOT NULL, payload BLOB NOT NULL);
+             CREATE TABLE board_widgets (descriptor_json TEXT, sha256 TEXT, granted_sha TEXT, grant_state TEXT);",
+        )
+        .unwrap();
+        let workspace = if id == 0 {
+            source_root.join(".openclaw/workspace")
+        } else {
+            root.child("ocm-home/envs/source/.openclaw/workspace")
+        };
+        let entry = serde_json::json!({
+            "sessionId": "fixture-session",
+            "sessionRoot": workspace,
+            "spawnedCwd": workspace.join("nested"),
+            "external": root.child("external/workspace"),
+            "sibling": format!("{}-sibling/workspace", source_root.display()),
+            "spawnedWorkspaceDir": workspace,
+            "worktree": {"repoRoot": workspace, "canonicalWorkspaceDir": workspace, "branch": workspace},
+            "opaque": {"sessionRoot": workspace},
+            "nativeRuntimeConsent": {"cwd": workspace},
+            "label": format!("retained {}", workspace.display())
+        });
+        db.execute(
+            "INSERT INTO session_nodes VALUES ('agent:main:fixture', ?1)",
+            [entry.to_string()],
+        )
+        .unwrap();
+        let binary = workspace.to_string_lossy().as_bytes().to_vec();
+        db.execute(
+            "INSERT INTO preserved VALUES ('keep user state', ?1)",
+            [&binary],
+        )
+        .unwrap();
+        let widget_source = format!(
+            "export default () => {:?};",
+            workspace.display().to_string()
+        );
+        let descriptor =
+            serde_json::json!({"pluginKind":"fixture", "source":widget_source}).to_string();
+        let sha = Sha256::digest(widget_source.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        db.execute(
+            "INSERT INTO board_widgets VALUES (?1, ?2, ?2, 'granted')",
+            rusqlite::params![descriptor, sha],
+        )
+        .unwrap();
+        let precise = format!(
+            r#"{{ "sessionRoot": {}, "opaque": {{"sessionRoot": {}}}, "number": 1e400 }}"#,
+            serde_json::to_string(&workspace).unwrap(),
+            serde_json::to_string(&workspace).unwrap()
+        );
+        db.execute(
+            "INSERT INTO session_nodes VALUES ('precise', ?1)",
+            [&precise],
+        )
+        .unwrap();
+        drop(db);
+        connection
+            .execute(
+                "INSERT INTO agent_databases VALUES (?1, ?2)",
+                rusqlite::params![id.to_string(), path.to_str().unwrap()],
+            )
+            .unwrap();
+        source_databases.push((
+            path.clone(),
+            fs::read(&path).unwrap(),
+            entry,
+            binary,
+            descriptor,
+            sha,
+            precise,
+        ));
+    }
+    let history = source_root.join(".openclaw/skill-workshop/history.sqlite");
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    let db = Connection::open(&history).unwrap();
+    db.execute_batch("CREATE TABLE history (path TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO history VALUES (?1)",
+        [source_root.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let history_before = fs::read(&history).unwrap();
     let before = fs::read(&source).unwrap();
     let wal_before = fs::read(source.with_extension("sqlite-wal")).unwrap();
     let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
@@ -119,6 +231,80 @@ fn env_clone_drops_database_owners_without_changing_source_or_durable_state() {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         42
+    );
+    for (relative, (path, before, mut entry, binary, descriptor, sha, precise)) in
+        databases.iter().zip(source_databases)
+    {
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let target = target_root.join(relative);
+        let db = Connection::open(&target).unwrap();
+        let actual: String = db
+            .query_row(
+                "SELECT entry_json FROM session_nodes WHERE session_key = 'agent:main:fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        entry["sessionRoot"] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        entry["spawnedCwd"] = serde_json::json!(target_root.join(".openclaw/workspace/nested"));
+        entry["spawnedWorkspaceDir"] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        for field in ["repoRoot", "canonicalWorkspaceDir"] {
+            entry["worktree"][field] = serde_json::json!(target_root.join(".openclaw/workspace"));
+        }
+        let widget: (String, String, String, String) = db
+            .query_row(
+                "SELECT descriptor_json, sha256, granted_sha, grant_state FROM board_widgets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(widget, (descriptor, sha.clone(), sha, "granted".into()));
+        let original_path = serde_json::to_string(&entry["opaque"]["sessionRoot"]).unwrap();
+        let expected_precise = precise.replacen(
+            &original_path,
+            &serde_json::to_string(&target_root.join(".openclaw/workspace")).unwrap(),
+            1,
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT entry_json FROM session_nodes WHERE session_key = 'precise'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            expected_precise
+        );
+
+        assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), entry);
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            db.query_row("SELECT value, payload FROM preserved", [], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?
+            )))
+            .unwrap(),
+            ("keep user state".into(), binary)
+        );
+    }
+    let registered: Vec<String> = copied
+        .prepare("SELECT path FROM agent_databases ORDER BY agent_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        registered,
+        databases.map(|relative| target_root.join(relative).display().to_string())
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+    assert_eq!(
+        fs::read(target_root.join(".openclaw/skill-workshop/history.sqlite")).unwrap(),
+        history_before
     );
 }
 
@@ -1577,4 +1763,45 @@ fn env_clone_rejects_external_configured_agent_directories_before_copying() {
                 .is_symlink()
         );
     }
+}
+
+#[test]
+fn env_clone_rolls_back_a_database_relocation_failure() {
+    let root = TestDir::new("clone-database-relocation-failure");
+    let env = ocm_env(&root);
+    let cwd = root.path();
+    let create = run_ocm(cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source_root = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+    let target_root = root.child("ocm-home/envs/target");
+    let database = source_root.join(".openclaw/state/openclaw.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TABLE agent_databases (path TEXT UNIQUE NOT NULL)")
+        .unwrap();
+    for path in [&source_root, &target_root] {
+        db.execute(
+            "INSERT INTO agent_databases VALUES (?1)",
+            [path.to_str().unwrap()],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let before = fs::read(&database).unwrap();
+    let clone = run_ocm(cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(!clone.status.success());
+    assert!(
+        stderr(&clone).contains("failed to relocate"),
+        "{}",
+        stderr(&clone)
+    );
+    assert_eq!(fs::read(&database).unwrap(), before);
+    assert!(!target_root.exists());
+    let show = run_ocm(cwd, &env, &["env", "show", "target"]);
+    assert!(!show.status.success());
+    assert!(
+        stderr(&show).contains("does not exist"),
+        "{}",
+        stderr(&show)
+    );
 }
