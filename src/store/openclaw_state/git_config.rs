@@ -170,11 +170,11 @@ pub(in crate::store) fn validate_copied_git_config(
     Ok(())
 }
 
-pub(in crate::store) fn relocate_workspace_git_config(
+pub(in crate::store) fn copied_workspace_git_contexts(
     source: &EnvPaths,
     target: &EnvPaths,
     workspaces: &OpenClawWorkspaceInventory,
-) -> Result<(Vec<CopiedGitConfigContext>, BTreeSet<PathBuf>), String> {
+) -> Result<Vec<CopiedGitConfigContext>, String> {
     let canonical_source = fs::canonicalize(&source.root).map_err(|e| e.to_string())?;
     let mappings = vec![
         (source.root.clone(), target.root.clone()),
@@ -251,8 +251,7 @@ pub(in crate::store) fn relocate_workspace_git_config(
             }
         }
     }
-    let retained = relocate_copied_git_config(&target.root, &mappings, &contexts)?;
-    Ok((contexts, retained))
+    Ok(contexts)
 }
 
 fn owned(root: &Path, path: &Path) -> Result<PathBuf, String> {
@@ -524,7 +523,7 @@ fn project(path: &Path, mappings: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-fn git_path(path: &Path) -> PathBuf {
+pub(super) fn git_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let raw = path.as_os_str().to_string_lossy();

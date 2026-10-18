@@ -804,12 +804,21 @@ fn clone_environment_with_policy(
             &source_paths.state_dir,
         )?;
         validate_nonportable_runtime_state_paths(&target_paths)?;
-        let (git_contexts, git_config_paths) =
-            super::openclaw_state::git_config::relocate_workspace_git_config(
-                &source_paths,
-                &target_paths,
-                &source_workspaces,
-            )?;
+        let canonical_source_root =
+            fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
+        let git_contexts = super::openclaw_state::git_config::copied_workspace_git_contexts(
+            &source_paths,
+            &target_paths,
+            &source_workspaces,
+        )?;
+        let copied_worktrees = super::openclaw_state::relocate_copied_worktrees(
+            &target_paths,
+            &[
+                (&source_paths.root, &target_paths.root),
+                (&canonical_source_root, &target_paths.root),
+            ],
+            git_contexts,
+        )?;
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
         let config_rewrite = match policy {
@@ -840,7 +849,8 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
-                    &git_config_paths,
+                    &copied_worktrees.preserved_roots,
+                    &copied_worktrees.config_paths,
                 )?;
                 outcome
             }
@@ -876,7 +886,8 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
-                    &git_config_paths,
+                    &copied_worktrees.preserved_roots,
+                    &copied_worktrees.config_paths,
                 )?;
                 Default::default()
             }
@@ -906,21 +917,16 @@ fn clone_environment_with_policy(
                     &target_paths,
                     env,
                     target_runtime,
-                    &git_config_paths,
+                    &copied_worktrees.preserved_roots,
+                    &copied_worktrees.config_paths,
                 )?;
                 outcome
             }
         };
 
-        super::openclaw_state::git_config::validate_copied_git_config(
-            &target_paths.root,
-            &git_contexts,
-        )?;
         super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
         // Sessions may store canonical paths even when the environment root
         // was registered through an alias (for example /var on macOS).
-        let canonical_source_root =
-            fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
         super::openclaw_state::relocate_copied_databases(
             &target_paths,
             &[&source_paths.root, &canonical_source_root],
@@ -928,6 +934,7 @@ fn clone_environment_with_policy(
             None,
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
+        copied_worktrees.finish(&target_paths)?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -967,7 +974,8 @@ fn clear_simulation_runtime_state_preserving_includes(
     target_paths: &super::layout::EnvPaths,
     env: &BTreeMap<String, String>,
     runtime: OpenClawWorkspaceRuntime<'_>,
-    git_config_paths: &BTreeSet<PathBuf>,
+    preserved_roots: &BTreeSet<PathBuf>,
+    preserved_files: &BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     let include_paths =
         openclaw_config_include_paths(&target_paths.config_path, &target_paths.state_dir)?;
@@ -976,7 +984,8 @@ fn clear_simulation_runtime_state_preserving_includes(
             target_paths,
             env,
             runtime,
-            git_config_paths,
+            preserved_roots,
+            preserved_files,
         )?;
         return Ok(());
     }
@@ -993,7 +1002,8 @@ fn clear_simulation_runtime_state_preserving_includes(
             target_paths,
             env,
             runtime,
-            git_config_paths,
+            preserved_roots,
+            preserved_files,
         )?;
         for include_path in &include_paths {
             let relative = include_path
@@ -2112,7 +2122,8 @@ mod tests {
             &paths,
             &BTreeMap::new(),
             OpenClawWorkspaceRuntime::default(),
-            &Default::default(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
         )
         .unwrap_err();
         assert!(

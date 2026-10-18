@@ -1912,6 +1912,625 @@ fn env_clone_rolls_back_a_database_relocation_failure() {
     );
 }
 
+fn managed_path_text(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    value.into_owned()
+}
+
+fn managed_git(cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args.iter().map(|value| managed_path_text(Path::new(value))))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", stderr(&output));
+    stdout(&output).trim().to_string()
+}
+
+fn seed_managed_checkout(
+    source: &Path,
+    relative: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let repo = source.join(".openclaw/workspace/repository");
+    fs::create_dir_all(&repo).unwrap();
+    managed_git(&repo, &["init", "-q"]);
+    write_text(&repo.join("owned.txt"), "base content\n");
+    managed_git(&repo, &["add", "owned.txt"]);
+    managed_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    managed_git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://example.invalid/fixture.git",
+        ],
+    );
+    let checkout = source.join(relative);
+    fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+    managed_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "openclaw/task",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    write_text(&checkout.join("owned.txt"), "authored staged content\n");
+    managed_git(&checkout, &["add", "owned.txt"]);
+    write_text(
+        &checkout.join("untracked.txt"),
+        &format!("authored source path: {}", source.display()),
+    );
+    managed_git(
+        &repo,
+        &["update-ref", "refs/openclaw/snapshots/fixture", "HEAD"],
+    );
+    let database = source.join(".openclaw/state/openclaw.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = Connection::open(database).unwrap();
+    db.execute_batch(
+        "CREATE TABLE worktrees (
+        id TEXT PRIMARY KEY, repo_fingerprint TEXT, repo_root TEXT, path TEXT,
+        branch TEXT, base_ref TEXT, snapshot_ref TEXT, owner_kind TEXT, owner_id TEXT,
+        provisioned_paths_json TEXT, removed_at INTEGER);
+        CREATE TABLE session_nodes (session_key TEXT PRIMARY KEY, entry_json TEXT);",
+    )
+    .unwrap();
+    db.execute("INSERT INTO worktrees VALUES ('managed-id','old-fingerprint',?1,?2,'openclaw/task','HEAD','refs/openclaw/snapshots/fixture','session','session-key',?3,NULL)",
+        rusqlite::params![repo.to_str().unwrap(), checkout.to_str().unwrap(), format!("{{\"authored\":\"{}\"}}", source.display())]).unwrap();
+    db.execute("INSERT INTO session_nodes VALUES ('session-key',?1)",
+        [serde_json::json!({"sessionId":"session-id", "sessionRoot":checkout, "spawnedCwd":checkout,
+            "worktree":{"id":"managed-id","branch":"openclaw/task","repoRoot":repo,"canonicalWorkspaceDir":repo}}).to_string()]).unwrap();
+    (repo, checkout)
+}
+
+fn file_bytes(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut bytes = std::collections::BTreeMap::new();
+    visit_files(root, &mut |path| {
+        bytes.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            fs::read(path).unwrap(),
+        );
+    });
+    bytes
+}
+
+#[test]
+fn env_clone_copied_git_config_preserves_complete_managed_graph_after_cleanup() {
+    for layout in [
+        "workspace/task",
+        "worktrees/old-fingerprint/task",
+        "configured/tasks/task",
+        "extensions/demo/node_modules/task",
+    ] {
+        let root = TestDir::new("clone-managed-worktree");
+        let env = ocm_env(&root);
+        let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+        let relative = format!(".openclaw/{layout}");
+        let (repo, checkout) = seed_managed_checkout(&source, &relative);
+        managed_git(&repo, &["branch", "locked"]);
+        write_text(
+            &repo.join(".git/info/custom/refs/authored.lock"),
+            "authored metadata",
+        );
+        if layout.starts_with("configured/") {
+            write_text(&source.join(".openclaw/openclaw.json"), &serde_json::json!({"agents":{"defaults":{"workspace":source.join(".openclaw/configured")}}}).to_string());
+        }
+        // Unrelated authored text remains unchanged during structural repair.
+        managed_git(
+            &repo,
+            &["config", "fixture.authored", source.to_str().unwrap()],
+        );
+        let sibling = source.join(".openclaw/worktrees/old-fingerprint/sibling");
+        managed_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        let source_private =
+            std::path::PathBuf::from(managed_git(&checkout, &["rev-parse", "--absolute-git-dir"]));
+        if layout.starts_with("worktrees/") {
+            let alternate = source.join(".openclaw/object cache");
+            fs::create_dir_all(alternate.join("info")).unwrap();
+            fs::create_dir_all(alternate.join("pack")).unwrap();
+            write_text(
+                &repo.join(".git/objects/info/alternates"),
+                &format!(
+                    "\"{}\"\n",
+                    managed_path_text(&alternate)
+                        .replace('\\', "\\\\")
+                        .replace(' ', "\\040")
+                ),
+            );
+            let library = source.join(".openclaw/workspace/library");
+            fs::create_dir_all(&library).unwrap();
+            managed_git(&library, &["init", "-q"]);
+            write_text(&library.join("library.txt"), "submodule data");
+            managed_git(&library, &["add", "library.txt"]);
+            managed_git(
+                &library,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "library",
+                ],
+            );
+            managed_git(
+                &checkout,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    library.to_str().unwrap(),
+                    "module",
+                ],
+            );
+        }
+        managed_git(&repo, &["config", "extensions.worktreeConfig", "true"]);
+        for path in [&repo, &checkout, &sibling] {
+            managed_git(
+                path,
+                &[
+                    "config",
+                    "--worktree",
+                    "core.worktree",
+                    &managed_path_text(path),
+                ],
+            );
+        }
+        let included = source.join(".openclaw/credentials/shared.git");
+        let inactive = source.join(".openclaw/credentials/inactive.git");
+        write_text(
+            &included,
+            "[fixture]\n ordered = owned\n[remote \"origin\"]\n url = https://example.invalid/configured.git\n",
+        );
+        write_text(&inactive, "inactive malformed [configuration");
+        write_text(
+            &source.join(".openclaw/credentials/discard"),
+            "runtime debris",
+        );
+        let quote_path = |path: &Path| serde_json::to_string(&managed_path_text(path)).unwrap();
+        let mut config = b"\xef\xbb\xbf".to_vec();
+        config.extend(fs::read(repo.join(".git/config")).unwrap());
+        config.extend_from_slice(
+            format!(
+                "\n[include]\n path = {}\n[fixture]\n ordered = middle\n[include]\n path = {}\n[includeIf \"onbranch:never-selected\"]\n path = {}\n",
+                quote_path(&included), quote_path(&included), quote_path(&inactive)
+            ).as_bytes(),
+        );
+        fs::write(repo.join(".git/config"), config).unwrap();
+        assert_eq!(
+            managed_git(&checkout, &["config", "--get-all", "fixture.ordered"]),
+            "owned\nmiddle\nowned"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if layout.starts_with("worktrees/") {
+                let object_store = source.join(".openclaw/object-store");
+                fs::rename(repo.join(".git/objects"), &object_store).unwrap();
+                std::os::unix::fs::symlink(&object_store, repo.join(".git/objects")).unwrap();
+                fs::rename(checkout.join(".git"), checkout.join("gitdir")).unwrap();
+                std::os::unix::fs::symlink("gitdir", checkout.join(".git")).unwrap();
+                let history = source.join(".openclaw/history-store");
+                fs::create_dir_all(history.join("nested")).unwrap();
+                std::os::unix::fs::symlink(
+                    "history-store/nested",
+                    source.join(".openclaw/skill-workshop"),
+                )
+                .unwrap();
+                fs::rename(checkout.join("gitdir"), history.join("ordinary-pointer")).unwrap();
+                std::os::unix::fs::symlink(
+                    source.join(".openclaw/skill-workshop/../ordinary-pointer"),
+                    checkout.join("gitdir"),
+                )
+                .unwrap();
+                fs::rename(
+                    source_private.join("gitdir"),
+                    source_private.join("backlink"),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink("backlink", source_private.join("gitdir")).unwrap();
+            }
+            for file in [
+                checkout.join(".git"),
+                source_private.join("gitdir"),
+                repo.join(".git/config"),
+            ] {
+                fs::set_permissions(file, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+        }
+        let source_index = fs::read(source_private.join("index")).unwrap();
+        let before = file_bytes(&source);
+        let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(file_bytes(&source), before);
+        let target = fs::canonicalize(root.child("ocm-home/envs/target")).unwrap();
+        let target_repo = target.join(".openclaw/workspace/repository");
+        let target_checkout = target.join(&relative);
+        let common = fs::canonicalize(target_repo.join(".git")).unwrap();
+        let private = fs::canonicalize(managed_git(
+            &target_checkout,
+            &["rev-parse", "--absolute-git-dir"],
+        ))
+        .unwrap();
+        assert!(private.starts_with(&target));
+        assert_eq!(fs::read(private.join("index")).unwrap(), source_index);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [
+                target_checkout.join(".git"),
+                private.join("gitdir"),
+                target_repo.join(".git/config"),
+            ] {
+                assert_eq!(
+                    fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o400
+                );
+            }
+        }
+        if layout.starts_with("worktrees/") {
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    fs::read_link(target_repo.join(".git/objects")).unwrap(),
+                    target.join(".openclaw/object-store")
+                );
+                assert_eq!(
+                    fs::read_link(repo.join(".git/objects")).unwrap(),
+                    source.join(".openclaw/object-store")
+                );
+            }
+            let alternate = target.join(".openclaw/object cache");
+            assert!(
+                managed_git(&target_repo, &["count-objects", "-v"])
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("alternate: "))
+                    .any(|path| fs::canonicalize(path).ok() == Some(alternate.clone()))
+            );
+            let module = target_checkout.join("module");
+            let module_git = managed_git(&module, &["rev-parse", "--absolute-git-dir"]);
+            assert!(fs::canonicalize(module_git).unwrap().starts_with(&target));
+            assert_eq!(
+                fs::canonicalize(managed_git(&module, &["rev-parse", "--show-toplevel"])).unwrap(),
+                module
+            );
+            assert_eq!(
+                fs::read_to_string(module.join("library.txt")).unwrap(),
+                "submodule data"
+            );
+        }
+
+        assert_eq!(
+            fs::canonicalize(managed_git(
+                &target_checkout,
+                &["rev-parse", "--git-common-dir"]
+            ))
+            .unwrap(),
+            common
+        );
+        assert_eq!(
+            fs::canonicalize(fs::read_to_string(private.join("gitdir")).unwrap().trim()).unwrap(),
+            fs::canonicalize(target_checkout.join(".git")).unwrap()
+        );
+        assert_eq!(
+            fs::read(target_checkout.join("untracked.txt")).unwrap(),
+            before[&std::path::PathBuf::from(&relative).join("untracked.txt")]
+        );
+        assert_eq!(
+            managed_git(&target_repo, &["config", "fixture.authored"]),
+            managed_path_text(&source)
+        );
+        assert!(
+            fs::read(target_repo.join(".git/config"))
+                .unwrap()
+                .starts_with(b"\xef\xbb\xbf")
+        );
+        assert!(
+            fs::read_to_string(target_repo.join(".git/config"))
+                .unwrap()
+                .contains("[includeIf \"onbranch:never-selected\"]")
+        );
+        assert_eq!(
+            fs::read(target.join(".openclaw/credentials/inactive.git")).unwrap(),
+            b"inactive malformed [configuration"
+        );
+        assert!(!target.join(".openclaw/credentials/discard").exists());
+        for path in [
+            &target_repo,
+            &target_checkout,
+            &target.join(".openclaw/worktrees/old-fingerprint/sibling"),
+        ] {
+            assert_eq!(
+                managed_git(path, &["config", "--get-all", "fixture.ordered"]),
+                "owned\nmiddle\nowned"
+            );
+            assert_eq!(
+                fs::canonicalize(managed_git(path, &["rev-parse", "--show-toplevel"])).unwrap(),
+                fs::canonicalize(path).unwrap()
+            );
+            assert_eq!(
+                fs::canonicalize(managed_git(
+                    path,
+                    &["config", "--worktree", "core.worktree"]
+                ))
+                .unwrap(),
+                fs::canonicalize(path).unwrap()
+            );
+            for selected in managed_git(path, &["config", "--get-all", "include.path"]).lines() {
+                assert_eq!(
+                    fs::canonicalize(selected).unwrap(),
+                    target.join(".openclaw/credentials/shared.git")
+                );
+            }
+        }
+        assert!(
+            target
+                .join(".openclaw/worktrees/old-fingerprint/sibling/owned.txt")
+                .is_file()
+        );
+        assert_eq!(
+            managed_git(&target_checkout, &["symbolic-ref", "HEAD"]),
+            "refs/heads/openclaw/task"
+        );
+        assert_eq!(
+            managed_git(
+                &target_repo,
+                &["rev-parse", "refs/openclaw/snapshots/fixture"]
+            ),
+            managed_git(&repo, &["rev-parse", "refs/openclaw/snapshots/fixture"])
+        );
+        let db = Connection::open(target.join(".openclaw/state/openclaw.sqlite")).unwrap();
+        let values: (String,String,String,String,String,String,String) = db.query_row(
+            "SELECT repo_root,path,repo_fingerprint,branch,base_ref,snapshot_ref,provisioned_paths_json FROM worktrees WHERE id='managed-id'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
+        assert_eq!(fs::canonicalize(values.0).unwrap(), target_repo);
+        assert_eq!(fs::canonicalize(values.1).unwrap(), target_checkout);
+        let expected_fingerprint = Sha256::digest(
+            format!(
+                "{}\nhttps://example.invalid/configured.git",
+                managed_path_text(&common)
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            values.2,
+            expected_fingerprint[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            (values.3.as_str(), values.4.as_str(), values.5.as_str()),
+            ("openclaw/task", "HEAD", "refs/openclaw/snapshots/fixture")
+        );
+        assert!(values.6.contains(source.to_str().unwrap()));
+        let session: String = db
+            .query_row("SELECT entry_json FROM session_nodes", [], |row| row.get(0))
+            .unwrap();
+        let session: Value = serde_json::from_str(&session).unwrap();
+        assert_eq!(session["worktree"]["id"], "managed-id");
+        assert_eq!(session["sessionId"], "session-id");
+        assert_eq!(
+            fs::canonicalize(session["sessionRoot"].as_str().unwrap()).unwrap(),
+            target_checkout
+        );
+        managed_git(
+            &target_repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "destination proof",
+                target_checkout.to_str().unwrap(),
+            ],
+        );
+        assert!(private.join("locked").is_file());
+        assert!(!source_private.join("locked").exists());
+        managed_git(
+            &target_repo,
+            &["worktree", "unlock", target_checkout.to_str().unwrap()],
+        );
+        assert_eq!(file_bytes(&source), before);
+        fs::rename(&source, source.with_extension("offline")).unwrap();
+        assert_eq!(
+            managed_git(
+                &target_checkout,
+                &["config", "--get-all", "fixture.ordered"]
+            ),
+            "owned\nmiddle\nowned"
+        );
+        assert_eq!(
+            managed_git(&target_checkout, &["rev-parse", "--verify", "HEAD"]),
+            managed_git(&target_repo, &["rev-parse", "--verify", "HEAD"])
+        );
+    }
+}
+
+#[test]
+fn env_clone_rolls_back_unresolvable_or_locked_managed_git_graphs() {
+    for variant in [
+        "missing",
+        "external-sibling",
+        "locked",
+        "git-lock",
+        "linked-ref-lock",
+        "alternate",
+        "lease",
+        "protected-history",
+        "protected-file-alias",
+        "protected-audit-namespace",
+        "protected-registry-namespace",
+    ] {
+        let root = TestDir::new("clone-managed-unsafe");
+        let env = ocm_env(&root);
+        assert!(
+            run_ocm(root.path(), &env, &["env", "create", "source"])
+                .status
+                .success()
+        );
+        let source = fs::canonicalize(root.child("ocm-home/envs/source")).unwrap();
+        let (repo, checkout) =
+            seed_managed_checkout(&source, ".openclaw/worktrees/old-fingerprint/task");
+        match variant {
+            "missing" => fs::remove_file(checkout.join(".git")).unwrap(),
+            "external-sibling" => {
+                managed_git(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-qb",
+                        "external",
+                        root.child("external").to_str().unwrap(),
+                    ],
+                );
+            }
+            "locked" => {
+                managed_git(
+                    &repo,
+                    &[
+                        "worktree",
+                        "lock",
+                        "--reason",
+                        "manual lock",
+                        checkout.to_str().unwrap(),
+                    ],
+                );
+            }
+            "git-lock" => write_text(&repo.join(".git/index.lock"), "unresolved writer"),
+            "linked-ref-lock" => {
+                #[cfg(unix)]
+                {
+                    let refs = source.join(".openclaw/owned-refs");
+                    fs::rename(repo.join(".git/refs/heads"), &refs).unwrap();
+                    std::os::unix::fs::symlink(&refs, repo.join(".git/refs/heads")).unwrap();
+                    write_text(&refs.join("openclaw/task.lock"), "unresolved writer");
+                }
+                #[cfg(not(unix))]
+                continue;
+            }
+            "alternate" => {
+                let external = root.child("external-objects");
+                fs::create_dir_all(&external).unwrap();
+                write_text(
+                    &repo.join(".git/objects/info/alternates"),
+                    external.to_str().unwrap(),
+                );
+            }
+            "protected-history" => {
+                #[cfg(unix)]
+                {
+                    let history = source.join(".openclaw/skill-workshop/support/git-pointer");
+                    fs::create_dir_all(history.parent().unwrap()).unwrap();
+                    fs::rename(checkout.join(".git"), &history).unwrap();
+                    std::os::unix::fs::symlink(&history, checkout.join(".git")).unwrap();
+                }
+                #[cfg(not(unix))]
+                continue;
+            }
+            "protected-file-alias" | "protected-audit-namespace" => {
+                #[cfg(unix)]
+                {
+                    let payload = source.join(".openclaw/history-store/config-audit.jsonl");
+                    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                    fs::rename(checkout.join(".git"), &payload).unwrap();
+                    let selector = if variant == "protected-file-alias" {
+                        let alias = source.join(".openclaw/skill-workshop/git-pointer");
+                        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink("../history-store/config-audit.jsonl", &alias)
+                            .unwrap();
+                        alias
+                    } else {
+                        std::os::unix::fs::symlink(
+                            payload.parent().unwrap(),
+                            source.join(".openclaw/logs"),
+                        )
+                        .unwrap();
+                        source.join(".openclaw/logs/config-audit.jsonl")
+                    };
+                    std::os::unix::fs::symlink(selector, checkout.join(".git")).unwrap();
+                }
+                #[cfg(not(unix))]
+                continue;
+            }
+            "protected-registry-namespace" => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    source.join(".openclaw/state"),
+                    source.join(".openclaw/skill-workshop"),
+                )
+                .unwrap();
+                #[cfg(not(unix))]
+                continue;
+            }
+            "lease" => {
+                let db = Connection::open(source.join(".openclaw/state/openclaw.sqlite")).unwrap();
+                db.execute_batch("CREATE TABLE state_leases(scope TEXT, lease_key TEXT); INSERT INTO state_leases VALUES ('worktree-run:managed-id','unresolved');").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = file_bytes(&source);
+        let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(!output.status.success(), "{variant} unexpectedly succeeded");
+        assert!(
+            stderr(&output).contains("cannot copy managed worktree"),
+            "{variant}: {}",
+            stderr(&output)
+        );
+        assert!(!root.child("ocm-home/envs/target").exists());
+        assert_eq!(file_bytes(&source), before);
+        let listing = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        let entries: Value = serde_json::from_str(&stdout(&listing)).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn env_clone_refuses_active_plugin_history_and_preserves_ordinary_aliases() {
