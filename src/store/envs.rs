@@ -33,8 +33,7 @@ use super::layout::{
 };
 use super::now_utc;
 use super::openclaw_state::{
-    clear_copied_runtime_state, openclaw_env_state_archive_options,
-    validate_nonportable_runtime_state_paths,
+    openclaw_env_state_archive_options, validate_nonportable_runtime_state_paths,
 };
 use super::{
     DevSourceRegistration, OpenClawWorkspaceRuntime, normalize_new_environment_sandbox_origin,
@@ -818,6 +817,7 @@ fn clone_environment_with_policy(
                 (&canonical_source_root, &target_paths.root),
             ],
             git_contexts,
+            &[],
         )?;
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
@@ -1456,14 +1456,17 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     target_runtime,
                 )?
             } else {
-                Default::default()
-            };
-            if let Some(permissions) = &config_directory_permissions {
-                fs::set_permissions(&target_paths.state_dir, permissions.clone())
-                    .map_err(|error| error.to_string())?;
-            }
-            if !extracted.metadata.include_state {
-                clear_copied_runtime_state(&target_paths, env, target_runtime)?;
+                let copied_git = super::openclaw_state::prepare_archived_worktrees(
+                    &target_paths,
+                    &source_roots,
+                )?;
+                super::openclaw_state::clear_copied_runtime_state_preserving_paths(
+                    &target_paths,
+                    env,
+                    target_runtime,
+                    &copied_git.preserved_roots,
+                    &copied_git.config_paths,
+                )?;
                 let copied_paths = super::openclaw_workspaces::resolve_env_openclaw_copy_paths(
                     &target_paths,
                     env,
@@ -1475,6 +1478,12 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     super::openclaw_state::DatabasePathRelocation::ClonedSessions,
                     Some(&copied_paths),
                 )?;
+                copied_git.finish(&target_paths)?;
+                Default::default()
+            };
+            if let Some(permissions) = &config_directory_permissions {
+                fs::set_permissions(&target_paths.state_dir, permissions.clone())
+                    .map_err(|error| error.to_string())?;
             }
 
             let created_at = now_utc();
