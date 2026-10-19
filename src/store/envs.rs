@@ -22,7 +22,7 @@ use super::common::{
     copy_dir_recursive, copy_dir_with_sqlite_snapshots, copy_path, ensure_dir, path_exists,
     read_json, write_json,
 };
-use super::dev_sources::ensure_root_outside_dev_sources;
+use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
 use super::gateway_ports::{
     DEFAULT_GATEWAY_PORT, choose_available_gateway_port, resolve_effective_gateway_ports,
     resolve_env_gateway_port,
@@ -1581,7 +1581,7 @@ pub(crate) fn ensure_environment_removal_preserves_registered_roots(
     target: &EnvMeta,
     envs: &[EnvMeta],
 ) -> Result<(), String> {
-    let removal = super::dev_sources::DevSourceRemoval::environment(target)?;
+    let removal = DevSourceRemoval::environment(target)?;
     for other in envs.iter().filter(|meta| meta.name != target.name) {
         let (registered, mut entries) =
             super::dev_registration::registration_path(Path::new(&other.root))?;
@@ -1592,6 +1592,35 @@ pub(crate) fn ensure_environment_removal_preserves_registered_roots(
                     "cannot remove environment {}: its cleanup contains registered environment {} root {} or a link needed to reach it; remove that environment separately first",
                     target.name, other.name, other.root
                 ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_runtime_cleanup_preserves_registered_roots(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+    paths: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let removals = paths
+        .iter()
+        .map(|path| DevSourceRemoval::entry(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for other in envs.iter().filter(|meta| meta.name != target.name) {
+        let registered =
+            super::dev_registration::inspect_registration_path(Path::new(&other.root))?;
+        for entry in registered.entries.iter().chain(registered.location.iter()) {
+            for removal in &removals {
+                if removal.contains_registered_path(entry)? {
+                    return Err(format!(
+                        "cannot clean up environment {}: its runtime reset contains registered environment {} root {} or a link needed to reach it; preserve any needed data and remove that environment separately before retrying",
+                        target.name, other.name, other.root
+                    ));
+                }
             }
         }
     }
