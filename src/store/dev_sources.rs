@@ -321,6 +321,7 @@ fn append_git_footprint(
     include_worktree_entry: bool,
     reserve_missing: bool,
     links: &mut BTreeSet<PathBuf>,
+    paths_left: &mut usize,
 ) -> Result<(), String> {
     for path in git.entries {
         record_git_path(&path, footprint, reserve_missing, links)?;
@@ -328,10 +329,65 @@ fn append_git_footprint(
     if include_worktree_entry && let Some(path) = git.worktree_entry {
         record_git_path(&path, footprint, reserve_missing, links)?;
     }
+    let objects = git.common_dir.join("objects");
     for path in [git.private_dir, git.common_dir] {
         if let Some(resolved) = record_git_path(&path, footprint, reserve_missing, links)? {
             footprint.content_roots.insert(resolved);
         }
+    }
+    append_git_object_footprint(footprint, objects, reserve_missing, links, paths_left)
+}
+
+fn git_dependency_limit_error(path: &Path, kind: &str) -> String {
+    format!(
+        "cannot inspect Git dependencies at '{}': too many {kind} paths; repair or consolidate these dependencies while preserving all required Git objects, then retry",
+        path.display()
+    )
+}
+
+fn append_git_object_footprint(
+    footprint: &mut SourceFootprint,
+    objects: PathBuf,
+    reserve_missing: bool,
+    links: &mut BTreeSet<PathBuf>,
+    paths_left: &mut usize,
+) -> Result<(), String> {
+    let mut pending = vec![objects];
+    let mut visited = BTreeSet::new();
+    // Bound the metadata graph, including repeated edges, without walking a
+    // checkout or its object files. Uninspectable graphs refuse the operation.
+    while let Some(objects) = pending.pop() {
+        if *paths_left == 0 {
+            return Err(git_dependency_limit_error(&objects, "alternate"));
+        }
+        *paths_left -= 1;
+        if existing_cleanup_path(&objects)?.is_none() {
+            if reserve_missing {
+                reserve_path(&objects, footprint)?;
+            }
+            continue;
+        }
+        let resolved = record_path_entries(&objects, &mut footprint.entries, links)?;
+        footprint.content_roots.insert(resolved.clone());
+        if !visited.insert(resolved.clone()) {
+            continue;
+        }
+        let file = resolved.join("info/alternates");
+        match fs::symlink_metadata(&file) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        if record_git_path(&file, footprint, reserve_missing, links)?.is_none() {
+            continue;
+        }
+        let alternates = crate::openclaw_repo::read_git_alternates(&file)?;
+        if alternates.len() + pending.len() > *paths_left {
+            return Err(git_dependency_limit_error(&file, "alternate"));
+        }
+        // Git resolves relative alternates against this object directory, not
+        // info/ or the checkout. Keep '..' until symlinks have been resolved.
+        pending.extend(alternates.into_iter().map(|path| resolved.join(path)));
     }
     Ok(())
 }
@@ -347,39 +403,85 @@ fn inspect_source_footprint_paths(
     reserve_missing: bool,
 ) -> Result<SourceFootprint, String> {
     let mut footprint = SourceFootprint::default();
-    if existing_cleanup_path(root)?.is_none() {
-        return Ok(footprint);
-    }
-    footprint.entries = existing_source_path_entries(root)?;
-    // Borrowed cleanup can preserve a missing Git target without accepting it
-    // for execution. Read only the known .git entry and its surviving aliases.
-    let git_entry = root.join(".git");
-    if reserve_missing && existing_cleanup_path(&git_entry)?.is_none() {
-        reserve_path(&git_entry, &mut footprint)?;
-        return Ok(footprint);
-    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = BTreeSet::new();
     let mut links = BTreeSet::new();
-    if let Some(git) = crate::openclaw_repo::git_identity_paths(root)? {
-        let registrations = if reserve_missing && existing_cleanup_path(&git.common_dir)?.is_none()
-        {
-            Vec::new()
-        } else {
-            match git.worktree_entry.as_ref().and_then(|path| path.parent()) {
-                Some(worktree) => {
-                    crate::openclaw_repo::git_registration_entries(&git.common_dir, worktree)?
-                }
-                None => Vec::new(),
-            }
+    let mut paths_left = 1024usize;
+    while let Some(root) = pending.pop() {
+        if paths_left == 0 {
+            return Err(git_dependency_limit_error(&root, "submodule"));
+        }
+        paths_left -= 1;
+        let Some(resolved) = existing_cleanup_path(&root)? else {
+            continue;
         };
-        append_git_footprint(&mut footprint, git, true, reserve_missing, &mut links)?;
-        for path in registrations {
+        footprint
+            .entries
+            .extend(existing_source_path_entries(&root)?);
+        if !visited.insert(resolved) {
+            continue;
+        }
+        // Borrowed cleanup preserves missing Git targets without accepting them
+        // for execution, including initialized submodules' surviving aliases.
+        let git_entry = root.join(".git");
+        if reserve_missing && existing_cleanup_path(&git_entry)?.is_none() {
+            reserve_path(&git_entry, &mut footprint)?;
+            continue;
+        }
+        if let Some(git) = crate::openclaw_repo::git_identity_paths(&root)? {
+            let metadata_present = existing_cleanup_path(&git.private_dir)?.is_some()
+                && existing_cleanup_path(&git.common_dir)?.is_some();
+            let registrations = if reserve_missing
+                && existing_cleanup_path(&git.common_dir)?.is_none()
+            {
+                Vec::new()
+            } else {
+                match git.worktree_entry.as_ref().and_then(|path| path.parent()) {
+                    Some(worktree) => {
+                        crate::openclaw_repo::git_registration_entries(&git.common_dir, worktree)?
+                    }
+                    None => Vec::new(),
+                }
+            };
             append_git_footprint(
                 &mut footprint,
-                crate::openclaw_repo::git_registration_paths(&path)?,
+                git,
                 true,
                 reserve_missing,
                 &mut links,
+                &mut paths_left,
             )?;
+            for path in registrations {
+                append_git_footprint(
+                    &mut footprint,
+                    crate::openclaw_repo::git_registration_paths(&path)?,
+                    true,
+                    reserve_missing,
+                    &mut links,
+                    &mut paths_left,
+                )?;
+            }
+            let modules = root.join(".gitmodules");
+            match fs::symlink_metadata(&modules) {
+                Ok(_) => {
+                    record_git_path(&modules, &mut footprint, reserve_missing, &mut links)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            for relative in crate::openclaw_repo::git_submodule_paths(&root, metadata_present)? {
+                let child = root.join(relative);
+                // An uninitialized submodule has no checkout identity. Require
+                // its own .git entry instead of discovering the parent's again.
+                match fs::symlink_metadata(child.join(".git")) {
+                    Ok(_) => pending.push(child),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                if pending.len() > paths_left {
+                    return Err(git_dependency_limit_error(&modules, "submodule"));
+                }
+            }
         }
     }
     Ok(footprint)
@@ -391,6 +493,7 @@ pub(crate) fn inspect_dev_source_metadata(dev: &EnvDevMeta) -> Result<SourceFoot
     };
     let mut footprint = inspect_source_footprint(Path::new(repo_root))?;
     let mut links = BTreeSet::new();
+    let mut paths_left = 1024usize;
     for path in crate::openclaw_repo::worktree_registration_entries(
         Path::new(repo_root),
         Path::new(worktree_root),
@@ -403,6 +506,7 @@ pub(crate) fn inspect_dev_source_metadata(dev: &EnvDevMeta) -> Result<SourceFoot
             false,
             false,
             &mut links,
+            &mut paths_left,
         )?;
     }
     Ok(footprint)

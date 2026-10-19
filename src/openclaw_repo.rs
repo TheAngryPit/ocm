@@ -997,6 +997,208 @@ pub(crate) fn read_git_pointer(
     }))
 }
 
+// Git paths use C quoting, including three-digit octal byte escapes.
+// A malformed quoted alternate is a literal path, matching Git's fallback.
+pub(crate) fn unquote_git_path(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if input.first() != Some(&b'"') {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut cursor = 1;
+    loop {
+        let byte = *input.get(cursor)?;
+        cursor += 1;
+        match byte {
+            b'"' => return Some((bytes, cursor)),
+            b'\\' => {
+                let escaped = *input.get(cursor)?;
+                cursor += 1;
+                bytes.push(match escaped {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'\\' | b'"' => escaped,
+                    b'0'..=b'3' => {
+                        let digits = input.get(cursor..cursor + 2)?;
+                        if !digits.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                            return None;
+                        }
+                        cursor += 2;
+                        ((escaped - b'0') << 6) | ((digits[0] - b'0') << 3) | (digits[1] - b'0')
+                    }
+                    _ => return None,
+                });
+            }
+            0 => return None,
+            _ => bytes.push(byte),
+        }
+    }
+}
+
+// Read only Git's explicit object-store references, never the objects themselves.
+// Keep the same bounded metadata reads as Git identity pointers.
+pub(crate) fn read_git_alternates(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(format!(
+            "invalid Git alternates file: {}",
+            display_path(path)
+        ));
+    }
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(65537)
+        .read_to_end(&mut contents)
+        .map_err(|error| error.to_string())?;
+    if contents.len() > 65536 {
+        return Err(format!(
+            "invalid Git alternates file: {}",
+            display_path(path)
+        ));
+    }
+    // Git treats the file as a NUL-terminated string. Quoted paths can contain
+    // escaped newlines; malformed quoting falls back to the literal line.
+    let end = contents
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(contents.len());
+    let mut remaining = &contents[..end];
+    let mut paths = Vec::new();
+    while !remaining.is_empty() {
+        let end = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(remaining.len());
+        if end == 0 || remaining[0] == b'#' {
+            remaining = &remaining[(end + 1).min(remaining.len())..];
+            continue;
+        }
+        let (mut raw, consumed) =
+            unquote_git_path(remaining).unwrap_or_else(|| (remaining[..end].to_vec(), end));
+        remaining = &remaining[(consumed + 1).min(remaining.len())..];
+        if let Some(end) = raw.iter().position(|byte| *byte == 0) {
+            raw.truncate(end);
+        }
+        if !raw.is_empty() {
+            paths.push(PathBuf::from(git_path_from_bytes(&raw)?));
+        }
+    }
+    Ok(paths)
+}
+
+// Git owns .gitmodules syntax and falls back to the index, then HEAD, when
+// its working file is absent. Inspect only this bounded metadata, without includes.
+pub(crate) fn git_submodule_paths(
+    root: &Path,
+    metadata_present: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let file = root.join(".gitmodules");
+    let invalid = || format!("invalid Git submodule metadata: {}", display_path(&file));
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--no-includes", "--null"]);
+    match fs::metadata(&file) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > 65536 {
+                return Err(invalid());
+            }
+            command.args(["--file", ".gitmodules"]);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Missing borrowed Git directories stay reserved for recovery. They
+            // cannot supply an index/HEAD fallback until restored.
+            if !metadata_present {
+                return Ok(Vec::new());
+            }
+            let mut selected = None;
+            for revision in [":.gitmodules", "HEAD:.gitmodules"] {
+                let object = git_command()
+                    .arg("-C")
+                    .arg(root)
+                    .args(["rev-parse", "--verify", "--quiet", revision])
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if object.status.code() == Some(1) {
+                    continue;
+                }
+                if !object.status.success() {
+                    return Err(invalid());
+                }
+                selected = Some(
+                    String::from_utf8(object.stdout)
+                        .map_err(|_| invalid())?
+                        .trim()
+                        .to_string(),
+                );
+                break;
+            }
+            let Some(object) = selected else {
+                return Ok(Vec::new());
+            };
+            let size = git_command()
+                .arg("-C")
+                .arg(root)
+                .args(["cat-file", "-s", &object])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !size.status.success()
+                || !String::from_utf8_lossy(&size.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .is_ok_and(|size| size <= 65536)
+            {
+                return Err(invalid());
+            }
+            command.args(["--blob", &object]);
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let output = command
+        .args(["--get-regexp", "^submodule\\..*\\.path$"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cannot read Git submodule metadata: {}",
+            display_path(&file)
+        ));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let separator = entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or("invalid Git submodule path output")?;
+            let path = PathBuf::from(git_path_from_bytes(&entry[separator + 1..])?);
+            if path.as_os_str().is_empty()
+                || path.components().any(|part| {
+                    !matches!(
+                        part,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err("invalid Git submodule path".to_string());
+            }
+            Ok(path)
+        })
+        .collect()
+}
+
 fn git_top_level(path: &Path) -> Option<PathBuf> {
     git_rev_parse_path(path, "--show-toplevel")
 }
