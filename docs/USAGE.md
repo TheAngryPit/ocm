@@ -758,6 +758,15 @@ Relative values keep Git's containing-file or Git-directory context; external re
 Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
 Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
 
+Clone, both archive import modes, `migrate`, and `adopt import` also relocate
+source-owned paths inside accepted OpenClaw config includes, including nested
+and shared fragments. Plugin load paths point at the copied payload; explicitly
+external values and source files remain unchanged. Relative `$include`
+directives and fragments needing no rewrite retain their authored contents.
+Rewritten fragments retain their copied Unix file modes.
+The existing restrictions on include-owned agent workspaces and sandbox origins
+still apply.
+
 Clone does not copy dev source bindings. The usual next step is:
 
 ```bash
