@@ -1567,6 +1567,27 @@ pub fn remove_environment(
     remove_environment_locked(name, force, env, cwd, |_| Ok(()))
 }
 
+pub(crate) fn ensure_environment_removal_preserves_registered_roots(
+    target: &EnvMeta,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    let removal = super::dev_sources::DevSourceRemoval::environment(target)?;
+    for other in envs.iter().filter(|meta| meta.name != target.name) {
+        let (registered, mut entries) =
+            super::dev_registration::registration_path(Path::new(&other.root))?;
+        entries.insert(registered);
+        for entry in entries {
+            if removal.contains_registered_path(&entry)? {
+                return Err(format!(
+                    "cannot remove environment {}: its cleanup contains registered environment {} root {} or a link needed to reach it; remove that environment separately first",
+                    target.name, other.name, other.root
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_environment_locked(
     name: &str,
     force: bool,
@@ -1591,6 +1612,7 @@ pub(crate) fn remove_environment_locked(
 
     let paths = derive_env_paths(Path::new(&meta.root));
 
+    ensure_environment_removal_preserves_registered_roots(&meta, &registry.envs)?;
     super::dev_sources::ensure_environment_removal_preserves_dev_sources(
         &meta,
         &registry.envs,
