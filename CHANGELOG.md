@@ -32,6 +32,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Refresh twelve compatible Rust dependencies, including zip 9.0.5, json5 1.3.3, and libc 0.2.191, while retaining Rust 1.88 support.
 - Update zip to 9.0.4 and refresh the pinned Rust toolchain installer action while retaining Rust 1.88 support.
 - Refresh eleven compatible Rust dependencies, including rustls 0.23.46, serde_json 1.0.154, and zip 9.0.3, while retaining Rust 1.88 support.
 - Refresh seven compatible Rust dependencies, including cc 1.7.0 and smallvec 1.16.3, while retaining Rust 1.88 support.
@@ -48,6 +49,8 @@ All notable changes to OCM are documented here.
 - Resolve and package the complete transitive closure of private OpenClaw `workspace:*` dependencies during `runtime build-local`, rewriting nested workspace specs only inside scratch archives so current source graphs install without mutating the checkout.
 
 ### Fixed
+
+- Refuse snapshot restores and upgrade rollbacks that would replace another registered environment's complete root or access links, including legacy nested and temporarily missing roots. Thanks @shakkernerd (#526, #527).
 
 - Relocate session, recorded file, worktree, and other text references across registered OpenClaw databases during state-inclusive import, with per-database counts and unchanged binary payloads.
 

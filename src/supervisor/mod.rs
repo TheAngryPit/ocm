@@ -3855,6 +3855,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dynamic_child_publication_failure_prevents_spawn_and_allows_retry() {
+        const ISOLATED: &str = "OCM_TEST_ISOLATED_PUBLICATION_RETRY";
+        if std::env::var(ISOLATED).as_deref() != Ok("1") {
+            // A parallel pre-exec fixture can retain any listening sockets
+            // inherited at fork. Keep this socket-sensitive proof independent.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::dynamic_child_publication_failure_prevents_spawn_and_allows_retry",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated publication retry failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let env = BTreeMap::from([
             ("HOME".to_string(), display_path(&root.path().join("home"))),
